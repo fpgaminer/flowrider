@@ -1,50 +1,78 @@
-mod server;
 mod cache;
+mod server;
 
 
 use std::{
-	collections::HashSet, fmt::Display, fs, io::{Cursor, Read, Seek, SeekFrom}, os::linux::net::SocketAddrExt, path::{Path, PathBuf}, sync::Arc
+	collections::HashSet,
+	env,
+	fmt::Display,
+	fs::{self},
+	io::{Cursor, Read, Seek, SeekFrom, Write},
+	os::linux::net::SocketAddrExt,
+	path::{Path, PathBuf},
+	sync::{Arc, Mutex},
+	thread::{self, JoinHandle},
 };
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use byteorder::ReadBytesExt;
+use ndarray::prelude::*;
+use numpy::{IntoPyArray, PyArray1};
 use pyo3::{
-	IntoPyObjectExt,
 	exceptions::{PyIOError, PyValueError},
 	prelude::*,
 	types::{PyBytes, PyDict, PyString},
 };
-use serde::Deserialize;
-use tokio::{runtime, sync::Semaphore};
-use url::Url;
+use pythonize::{depythonize, pythonize};
+use rand::{prelude::*, seq::index::sample};
+use rand_chacha::ChaCha8Rng;
+use serde::{Deserialize, Serialize};
 use std::os::unix::net::SocketAddr as StdSocketAddr;
+use tempfile::{NamedTempFile, TempPath};
+use url::Url;
+use xxhash_rust::xxh3::xxh3_128;
 
-use crate::server::{download_file, server_entrypoint, start_server, SocketConnection};
+use crate::server::{SocketConnection, start_server};
 
 
-struct GlobalConfig {
+const DEFAULT_NUM_CACHE_WORKERS: usize = 8;
+
+
+/*struct GlobalConfig {
 	local_rank: u32,
 	node_rank: u32,
 	#[allow(dead_code)]
 	world_size: u32,
 	socket_name: String,
 	cache_dir: PathBuf,
-}
+}*/
 
-static GLOBAL_CONFIG: std::sync::OnceLock<GlobalConfig> = std::sync::OnceLock::new();
+//static GLOBAL_CONFIG: std::sync::OnceLock<GlobalConfig> = std::sync::OnceLock::new();
+//static SOCKET_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+//static CACHE_SERVER_RUNNING: std::sync::Once = std::sync::Once::new();
+/// The PID of the process we were initialized in.  This should mitigate some weird forking issues.  If a forked process tries to use this module, it will still reference the original process's PID, enabling it
+/// to find the cache server socket.
+static INITIAL_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
-fn get_global_config() -> &'static GlobalConfig {
+/// Configuration the cache server was started with.  Used to warn the user if they try to use a different cache directory or socket name after the server has started.
+/// Also used to ensure that the cache server is only started once per node.
+//static CACHE_SERVER_CONFIG: std::sync::OnceLock<(PathBuf, String)> = std::sync::OnceLock::new();
+
+/*fn get_global_config() -> &'static GlobalConfig {
 	GLOBAL_CONFIG.get().expect("Global configuration not initialized. Did you call `init`?")
-}
-
+}*/
 
 #[pymodule]
 fn flowrider(m: &Bound<'_, PyModule>) -> PyResult<()> {
-	m.add_class::<Stream>()?;
+	pyo3_log::init();
+
+	INITIAL_PID
+		.set(std::process::id())
+		.map_err(|_| PyValueError::new_err("INITIAL_PID was already set. This module should only be initialized once per process."))?;
+
 	m.add_class::<StreamingDataset>()?;
-	m.add_function(wrap_pyfunction!(build_streams, m)?)?;
-	m.add_function(wrap_pyfunction!(server_entrypoint, m)?)?;
-	m.add_function(wrap_pyfunction!(init, m)?)?;
+	m.add_class::<Config>()?;
+	//m.add_function(wrap_pyfunction!(server_entrypoint, m)?)?;
 	Ok(())
 }
 
@@ -57,12 +85,21 @@ fn flowrider(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// world_size: The total number of processes in the distributed group.
 /// master_addr: The address of the master node (usually MASTER_ADDR).
 /// master_port: The port of the master node (usually MASTER_PORT).
-/// 
+///
 /// If running on a single rank (no distributed training), set `local_rank` and `node_rank` to 0 and `world_size` to 1; master_addr and master_port can be None.
-/// 
+///
 /// A unique socket name will be generated based on the master address and port, or the process ID if they are not set. This is used to communicate with the cache server.
-#[pyfunction]
-fn init(cache_limit: u64, max_downloads: usize, local_rank: u32, node_rank: u32, world_size: u32, cache_dir: &str, master_addr: Option<&str>, master_port: Option<u16>) {
+/*#[pyfunction]
+fn init(
+	cache_limit: u64,
+	max_downloads: usize,
+	local_rank: u32,
+	node_rank: u32,
+	world_size: u32,
+	cache_dir: &str,
+	master_addr: Option<&str>,
+	master_port: Option<u16>,
+) {
 	// create a socket name unique to this run, based on the master address and port, or the process ID if they are not set (non-distributed case).
 	let socket_name = match (master_addr, master_port) {
 		(Some(addr), Some(port)) => {
@@ -87,7 +124,7 @@ fn init(cache_limit: u64, max_downloads: usize, local_rank: u32, node_rank: u32,
 		panic!("Global configuration already initialized. Please ensure you call `init` only once per process.");
 	}
 
-		// We only want to spawn the flowrider server once (per node), so it's hidden after the panic check above and only spawnned on the local leader
+	// We only want to spawn the flowrider server once (per node), so it's hidden after the panic check above and only spawnned on the local leader
 	if local_rank == 0 {
 		println!("Spawning flowrider server...");
 		/*let exe_dir = std::env::current_exe()
@@ -128,18 +165,227 @@ fn init(cache_limit: u64, max_downloads: usize, local_rank: u32, node_rank: u32,
 
 		println!("Flowrider server spawned successfully.");
 	}
+}*/
+
+#[pyclass(frozen, str)]
+#[derive(Clone, Serialize, Deserialize)]
+struct Config {
+	/// Rank of this process on the local node (0 for the first process).
+	local_rank: u32,
+	/// Rank of this process in the distributed group (between 0 and world size - 1).
+	global_rank: u32,
+	/// Total number of processes in the distributed group.
+	#[allow(dead_code)]
+	world_size: u32,
+	/// Name that uniquely identifies the socket for the cache server.
+	socket_name: String,
+	/// Directory where the cache is stored.
+	cache_dir: PathBuf,
+	/// Maximum number of concurrent downloads allowed.
+	max_downloads: usize,
 }
 
+#[pymethods]
+impl Config {
+	/// cache_dir: The directory where the cache is stored.
+	/// cache_limit: The maximum size of the cache in bytes.  If set to 0, the cache will not be limited.
+	/// max_downloads: The maximum number of concurrent downloads allowed.
+	/// local_rank: The rank of this process on the local node (0 for the first process).
+	/// global_rank: The rank of this process in the distributed group (between 0 and world size - 1).
+	/// world_size: The total number of processes in the distributed group.
+	/// master_addr: The address of the master node (usually MASTER_ADDR).
+	/// master_port: The port of the master node (usually MASTER_PORT).
+	///
+	/// If running on a single rank (no distributed training), set `local_rank` and `global_rank` to 0 and `world_size` to 1; master_addr and master_port can be None.
+	/// If local_rank, global_rank, etc are left as None they will be set from the typical PyTorch environment variables if available.  If those environment variables are not set, this will default to a single process run (local_rank = 0, global_rank = 0, world_size = 1).
+	/// Note: This function will start the background cache server if it is not already running.  The cache server will only be started once per node.  It runs as a background thread of one of the processes on this local node.
+	/// If the process running the cache server gets forked (which is the default for PyTorch dataloader workers), the fact that the cache server is in a different thread ensures it does not survive to the child processes (which is good, because it has non-fork safe state).
+	#[new]
+	#[pyo3(signature = (cache_dir, cache_limit=0, max_downloads=8, num_cache_workers=None, local_rank=None, global_rank=None, world_size=None, master_addr=None, master_port=None))]
+	#[allow(clippy::too_many_arguments)]
+	fn new(
+		cache_dir: &str,
+		cache_limit: u64,
+		max_downloads: usize,
+		num_cache_workers: Option<usize>,
+		local_rank: Option<u32>,
+		global_rank: Option<u32>,
+		world_size: Option<u32>,
+		master_addr: Option<&str>,
+		master_port: Option<u16>,
+	) -> PyResult<Self> {
+		let num_cache_workers = num_cache_workers.unwrap_or(DEFAULT_NUM_CACHE_WORKERS);
+		let local_rank = local_rank
+			.or_else(|| env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<u32>().ok()))
+			.unwrap_or(0);
+		let global_rank = global_rank
+			.or_else(|| env::var("GROUP_RANK").ok().and_then(|s| s.parse::<u32>().ok()))
+			.unwrap_or(0);
+		let world_size = world_size
+			.or_else(|| env::var("WORLD_SIZE").ok().and_then(|s| s.parse::<u32>().ok()))
+			.unwrap_or(1);
+		let master_addr = master_addr.map(String::from).or_else(|| env::var("MASTER_ADDR").ok());
+		let master_port = master_port.or_else(|| env::var("MASTER_PORT").ok().and_then(|s| s.parse::<u16>().ok()));
 
-// TODO: Return numpy types
+		if world_size == 0 {
+			return Err(PyValueError::new_err("world_size cannot be 0"));
+		}
+
+		if local_rank >= world_size {
+			return Err(PyValueError::new_err(format!(
+				"local_rank ({}) must be less than world_size ({})",
+				local_rank, world_size
+			)));
+		}
+
+		if global_rank >= world_size {
+			return Err(PyValueError::new_err(format!(
+				"global_rank ({}) must be less than world_size ({})",
+				global_rank, world_size
+			)));
+		}
+
+		// create a socket name unique to this run, based on the master address and port, or the process ID in the non-distributed case.
+		let socket_name = match (master_addr, master_port) {
+			(Some(addr), Some(port)) => format!("flowrider-socket-{}-{}", addr, port),
+			(None, None) => {
+				if world_size != 1 {
+					return Err(PyValueError::new_err(
+						"master_addr and master_port must both be set if running in distributed mode (local_rank != 0, global_rank != 0, world_size != 1)",
+					));
+				}
+				format!("flowrider-socket-pid-{}", INITIAL_PID.get().expect("INITIAL_PID not set"))
+			},
+			_ => return Err(PyValueError::new_err("master_addr and master_port must both be set or both be None")),
+		};
+
+		// Create a temporary file and write our server configuration to it.
+		let mut tempfile = NamedTempFile::new().map_err(|e| PyIOError::new_err(format!("Failed to create temporary file: {:?}", e)))?;
+		tempfile
+			.write_all(cache_dir.as_bytes())
+			.map_err(|e| PyIOError::new_err(format!("Failed to write to temporary file: {:?}", e)))?;
+		tempfile
+			.as_file_mut()
+			.sync_all()
+			.map_err(|e| PyIOError::new_err(format!("Failed to sync temporary file: {:?}", e)))?;
+
+		// Now try to atomically move it to a location all processes agree on.  In this case, the temp folder with the name `<socket_name>-server-config`.
+		// Only one process will succeed in this.  This process will start the cache server, and `<socket_name>-server-config` will reflect the configuration of that running server.
+		// All other processes will read this file to confirm the server is running with the same configuration they expect.
+		// Note that `<socket_name>-server-config` will be cleaned up automatically when the server stops, so we don't need to worry about leaving behind stale files.
+		let server_config_path = tempfile.path().with_file_name(format!("{}-server-config", socket_name));
+		let server_config = match tempfile.persist_noclobber(&server_config_path) {
+			Ok(_) => {
+				// We won the race - spawn the server
+				println!("Spawning flowrider server...");
+				/*let exe_dir = std::env::current_exe()
+					.expect("Failed to get current executable directory")
+					.parent()
+					.expect("Failed to get parent directory of executable")
+					.join("flowrider-server");
+				//let server_path = exe_dir.join("flowrider-server");
+
+				unsafe {
+					let _child = Command::new(exe_dir)
+						.args(["--socket-name", &socket_name, "--cache-limit", &cache_limit.to_string(), "--max-downloads", &max_downloads.to_string(), "--cache-dir", cache_dir])
+						.stdout(Stdio::inherit())
+						.stderr(Stdio::inherit())
+						.pre_exec(move || {
+							// this code runs inside the child process just after fork and before execve
+							// we want to as kthe kernel to kill us when the original process dies
+							// to ensure we don't leave behind a zombie server
+							if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+								return Err(std::io::Error::last_os_error());
+							}
+							if libc::getppid() == 1 {
+								// parent vanished between fork and here - bail out!
+								return Err(std::io::Error::new(std::io::ErrorKind::Other, "parent died before exec"));
+							}
+							Ok(())
+						})
+						.spawn()
+						.expect("Failed to spawn flowrider server process");
+				}*/
+
+				let server_config_path = TempPath::from_path(&server_config_path);
+				let cache_dir_clone = cache_dir.to_owned();
+				let socket_name = socket_name.clone();
+				thread::spawn(move || {
+					// This will block until the server is stopped.
+					start_server(&socket_name, cache_limit, max_downloads, cache_dir_clone, num_cache_workers);
+
+					// Ensure we hang onto the server config file until the server stops, at which point it will be dropped and thus deleted.
+					drop(server_config_path);
+				});
+
+				println!("Flowrider server spawned successfully.");
+
+				cache_dir.to_owned()
+			},
+			Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+				// Another process beat us.  Read the running server's configuration from the file.
+				fs::read_to_string(server_config_path).map_err(|e| PyIOError::new_err(format!("Failed to read server config file: {:?}", e)))?
+			},
+			Err(e) => {
+				// Something weird happened
+				return Err(PyIOError::new_err(format!("Failed to persist temporary file: {:?}", e)));
+			},
+		};
+
+		// Make sure the running server has the same configuration as us.
+		if server_config.trim() != cache_dir {
+			return Err(PyValueError::new_err(format!(
+				"Cache server already running with a different configuration. Expected cache_dir: {}, but got: {}",
+				cache_dir, server_config
+			)));
+		}
+
+		Ok(Config {
+			local_rank,
+			global_rank,
+			world_size,
+			socket_name,
+			cache_dir: PathBuf::from(cache_dir),
+			max_downloads,
+		})
+	}
+}
+
+impl Display for Config {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"Config(local_rank={}, global_rank={}, world_size={}, socket_name={}, cache_dir={})",
+			self.local_rank,
+			self.global_rank,
+			self.world_size,
+			self.socket_name,
+			self.cache_dir.display()
+		)
+	}
+}
+
+impl Config {
+	fn get_socket_addr(&self) -> StdSocketAddr {
+		// Use abstract namespace to avoid leaving behind sockets in case of a crash or unexpected exit.
+		// Abstract namespace sockets get automatically cleaned up by the kernel when the process exits.
+		StdSocketAddr::from_abstract_name(self.socket_name.as_bytes()).expect("Failed to create abstract socket address")
+	}
+}
 
 
 #[pyclass(frozen, str)]
 struct StreamingDataset {
 	shards: Vec<MDSShardReader>,
 	shards_cum: Vec<u64>,
-	stream_ranges: Vec<(u64, u64)>, // (start, end) for each stream
+	stream_ranges: Vec<(u64, u64)>, // [start, end) for each stream (in global sample indices)
 	conn: std::sync::Mutex<SocketConnection>,
+
+	seed: Vec<u8>,
+	shuffle: bool,
+	drop_last: bool,
+	micro_batch_size: usize,
+	config: Config,
 }
 
 impl StreamingDataset {
@@ -147,17 +393,112 @@ impl StreamingDataset {
 	fn total_samples(&self) -> u64 {
 		*self.shards_cum.last().unwrap_or(&0)
 	}
+
+	/// Based on the parameters, returns a list of global sample indices that this device should process in the specified epoch.
+	fn get_my_work(&self, seed: &[u8], epoch: u64, shuffle: bool, drop_last: bool, micro_batch_size: usize) -> Vec<i64> {
+		println!(
+			"[{}] Getting work for epoch {} with seed {:?}, shuffle: {}, drop_last: {}, micro_batch_size: {}",
+			self.config.local_rank, epoch, seed, shuffle, drop_last, micro_batch_size
+		);
+		let world_size = self.config.world_size as usize;
+		let global_rank = self.config.global_rank as usize;
+		let total_samples = self.total_samples() as usize;
+		let mut ids = Vec::with_capacity(total_samples);
+
+		// Deterministic shuffling based on the seed and epoch.
+		let seed1 = xxh3_128(seed);
+		let seed2 = xxh3_128(&epoch.to_le_bytes());
+		let mut seed = [0u8; 32];
+		seed[..16].copy_from_slice(&seed1.to_le_bytes());
+		seed[16..].copy_from_slice(&seed2.to_le_bytes());
+		let mut rng = ChaCha8Rng::from_seed(seed);
+
+		// We start by going through each stream, because batches cannot contain samples from different streams.
+		for (sample_begin, sample_end) in &self.stream_ranges {
+			// get a list of all sample IDs in this stream, shuffled if requested.
+			let stream_samples = sample_end - sample_begin;
+			let mut stream_ids = if shuffle {
+				sample(&mut rng, stream_samples as usize, stream_samples as usize)
+					.into_iter()
+					.map(|i| i as i64 + *sample_begin as i64)
+					.collect::<Vec<_>>()
+			} else {
+				((*sample_begin as i64)..(*sample_end as i64)).collect::<Vec<_>>()
+			};
+
+			// Pad or truncate to a multiple of the micro batch size
+			let remainder = stream_ids.len() % micro_batch_size;
+			if remainder > 0 && drop_last {
+				stream_ids.truncate(stream_ids.len() - remainder);
+			} else if remainder > 0 {
+				let padding = micro_batch_size - remainder;
+				stream_ids.extend((0..padding).map(|_| -1)); // Use -1 to indicate padding
+			}
+
+			// Add the stream IDs to the main list.
+			ids.extend(stream_ids.into_iter());
+		}
+
+		// At this point ids is already a multiple of micro_batch_size, but we'll also want it to divide evenly by the number of devices.
+		let n = micro_batch_size * world_size;
+		let remaining = ids.len() % n;
+		if remaining > 0 && drop_last {
+			ids.truncate(ids.len() - remaining);
+		} else if remaining > 0 {
+			ids.extend((0..(n - remaining)).map(|_| -1)); // Use -1 to indicate padding
+		}
+
+		// Now shape into a 2D array of shape (_, micro_batch_size).
+		let num_micro_batches = ids.len() / micro_batch_size;
+		let mut ids = Array::from_shape_vec((num_micro_batches, micro_batch_size), ids).expect("Failed to create micro-batch array from IDs");
+
+		// Shuffle the micro-batches if requested.
+		if shuffle {
+			let indices = sample(&mut rng, ids.shape()[0], ids.shape()[0]);
+			ids = ids.select(Axis(0), &indices.into_vec());
+		}
+
+		// Shape into 3D array of shape (num_devices, _, micro_batch_size)
+		let num_micro_batches = ids.shape()[0] / world_size;
+		let ids = ids
+			.to_shape((world_size, num_micro_batches, micro_batch_size))
+			.expect("Failed to reshape IDs into 3D array");
+
+		// Select the micro-batches for this device (global_rank).
+		let ids = ids.slice(s![global_rank, .., ..]);
+
+		// Flatten and return as a Vec
+		ids.flatten().to_vec()
+	}
 }
 
 #[pymethods]
 impl StreamingDataset {
 	#[new]
-	fn new<'py>(streams: Vec<PyRef<'py, Stream>>) -> PyResult<StreamingDataset> {
+	fn new<'py>(
+		remotes_and_locals: Vec<(String, String)>,
+		config: Config,
+		seed: &[u8],
+		shuffle: bool,
+		drop_last: bool,
+		micro_batch_size: usize,
+		py: Python<'py>,
+	) -> PyResult<StreamingDataset> {
+		// Build the streams
+		let mut streams = build_streams(remotes_and_locals, &config, py).map_err(|e| PyValueError::new_err(format!("Failed to build streams: {:?}", e)))?;
+
+		// Sort streams by their local path to ensure consistent ordering.
+		// This is important for distributed training to ensure all processes see the same order even if the streams were handed to us differently.
+		streams.sort_by(|a, b| a.local.cmp(&b.local));
+
 		let mut shards: Vec<MDSShardReader> = Vec::new();
-		let mut locals = HashSet::new();  // to ensure unique local paths
-		let stream_ranges = Vec::new();    // todo
+		let mut locals = HashSet::new(); // to ensure unique local paths
+		let mut stream_ranges = Vec::new();
+		let mut shards_cum = vec![0]; // cumulative sum of samples in shards
+		let mut cum = 0;
 
 		for stream in streams.iter() {
+			let stream_start = cum;
 			for shard in &stream.shards {
 				if locals.contains(&shard.local) {
 					return Err(PyValueError::new_err(format!(
@@ -169,62 +510,152 @@ impl StreamingDataset {
 				// TODO: Is there some way for us to take ownership of the shard so we don't have to clone it here?
 				shards.push(shard.clone());
 				locals.insert(&shard.local);
+				cum += shard.samples as u64;
+				shards_cum.push(cum);
 			}
-		}
-
-		// cumsum of the shards to quickly find which shard contains a sample
-		let mut shards_cum = Vec::with_capacity(shards.len() + 1);
-		let mut cum = 0;
-		shards_cum.push(cum);
-		for shard in &shards {
-			cum += shard.samples as u64;
-			shards_cum.push(cum);
+			stream_ranges.push((stream_start, cum)); // store the range of samples for this stream
 		}
 
 		// connection to the cache server
-		let conn = std::sync::Mutex::new(SocketConnection::new(get_socket_path())
-				.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?);
-		
+		let conn = std::sync::Mutex::new(
+			SocketConnection::new(config.get_socket_addr(), config.local_rank as u8, config.global_rank as u8)
+				.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?,
+		);
 
 		Ok(StreamingDataset {
 			shards,
 			shards_cum,
 			stream_ranges,
 			conn,
+
+			seed: seed.to_vec(),
+			shuffle,
+			drop_last,
+			micro_batch_size,
+			config,
 		})
 	}
 
 	/// Read a sample based on its global sample index.
 	fn get_sample<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyDict>> {
 		if index >= self.total_samples() as usize {
-			return Err(PyValueError::new_err(format!("Sample index {} out of bounds for dataset with {} samples", index, self.total_samples())));
+			return Err(PyValueError::new_err(format!(
+				"Sample index {} out of bounds for dataset with {} samples",
+				index,
+				self.total_samples()
+			)));
 		}
 
 		// find the shard that contains the sample using binary search
 		let shard_index = self.shards_cum.partition_point(|&b| b <= index as u64) - 1;
 		let offset = index - self.shards_cum[shard_index] as usize;
 		let shard = &self.shards[shard_index];
-		let shard_hash = shard.hashes.xxh3_128
+		let shard_hash = shard
+			.hashes
+			.xxh3_128
 			.ok_or_else(|| PyValueError::new_err("Shard does not have xxh3_128 hash"))?;
 
-		println!("[{}] Getting sample {} from shard {} ({} samples), offset {}, hash: {:032x}",
-			get_local_rank(), index, shard_index, shard.samples, offset, shard_hash);
+		println!(
+			"[{}] Getting sample {} from shard {} ({} samples), offset {}, hash: {:032x}",
+			self.config.local_rank, index, shard_index, shard.samples, offset, shard_hash
+		);
 
 		// ask the cache server to make the shard available
-		self.conn.lock()
+		self.conn
+			.lock()
 			.map_err(|e| PyIOError::new_err(format!("Failed to lock cache connection: {:?}", e)))?
-			.send_message(shard.remote.as_str(), &shard.local, shard_hash, py)
+			.send_message(shard.remote.as_str(), &shard.local, Some(shard_hash), Some(py))
 			.map_err(|e| PyIOError::new_err(format!("Failed to send message to cache server: {:?}", e)))?;
 
 		// once the above request returns, the shard should be available on the filesystem
-		let data = shard.read_sample(offset)
+		let data = shard
+			.read_sample(offset, &self.config.cache_dir)
 			.map_err(|e| PyIOError::new_err(format!("Failed to read sample from shard: {:?}", e)))?;
-		shard.decode_sample(py, &data)
+		shard
+			.decode_sample(py, &data)
 			.map_err(|e| PyValueError::new_err(format!("Failed to decode sample data: {:?}", e)))
 	}
 
 	fn __len__(&self) -> usize {
 		self.total_samples() as usize
+	}
+
+	fn get_indices<'py>(&self, py: Python<'py>, epoch: u64) -> PyResult<Bound<'py, PyArray1<i64>>> {
+		let indices = self.get_my_work(&self.seed, epoch, self.shuffle, self.drop_last, self.micro_batch_size);
+		Ok(indices.into_pyarray(py))
+	}
+
+	/// Called to pickle the object.
+	/// Most of our state is bland and can be straightforwardly serialized, except for the connection to the cache server,
+	/// which we can just rebuild when unpickling.
+	fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+		#[derive(Serialize)]
+		struct StreamingDatasetState<'a> {
+			shards: &'a [MDSShardReader],
+			shards_cum: &'a [u64],
+			stream_ranges: &'a [(u64, u64)],
+			seed: &'a [u8],
+			shuffle: bool,
+			drop_last: bool,
+			micro_batch_size: usize,
+			config: &'a Config,
+		}
+
+		let snapshot = StreamingDatasetState {
+			shards: &self.shards,
+			shards_cum: &self.shards_cum,
+			stream_ranges: &self.stream_ranges,
+			seed: &self.seed,
+			shuffle: self.shuffle,
+			drop_last: self.drop_last,
+			micro_batch_size: self.micro_batch_size,
+			config: &self.config,
+		};
+		let obj = pythonize(py, &snapshot).map_err(|e| PyValueError::new_err(format!("Failed to pythonize StreamingDataset state: {:?}", e)))?;
+
+		obj.downcast_into::<PyDict>()
+			.map_err(|_| PyValueError::new_err("Failed to downcast StreamingDataset state to PyDict"))
+	}
+
+	/// Called to unpickle the object.
+	#[staticmethod]
+	fn __setstate__(state: Bound<'_, PyDict>) -> PyResult<StreamingDataset> {
+		#[derive(Deserialize)]
+		struct StreamingDatasetState {
+			shards: Vec<MDSShardReader>,
+			shards_cum: Vec<u64>,
+			stream_ranges: Vec<(u64, u64)>,
+			seed: Vec<u8>,
+			shuffle: bool,
+			drop_last: bool,
+			micro_batch_size: usize,
+			config: Config,
+		}
+
+		let snapshot: StreamingDatasetState =
+			depythonize(&state).map_err(|e| PyValueError::new_err(format!("Failed to depythonize StreamingDataset state: {:?}", e)))?;
+
+		let conn = Mutex::new(
+			SocketConnection::new(
+				snapshot.config.get_socket_addr(),
+				snapshot.config.local_rank as u8,
+				snapshot.config.global_rank as u8,
+			)
+			.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?,
+		);
+
+		Ok(StreamingDataset {
+			shards: snapshot.shards,
+			shards_cum: snapshot.shards_cum,
+			stream_ranges: snapshot.stream_ranges,
+			conn,
+
+			seed: snapshot.seed,
+			shuffle: snapshot.shuffle,
+			drop_last: snapshot.drop_last,
+			micro_batch_size: snapshot.micro_batch_size,
+			config: snapshot.config,
+		})
 	}
 }
 
@@ -235,24 +666,22 @@ impl Display for StreamingDataset {
 }
 
 
-/// We use abstract namespace to avoid leaving behind sockets in case of a crash or unexpected exit.
+/*/// We use abstract namespace to avoid leaving behind sockets in case of a crash or unexpected exit.
 /// Abstract namespace sockets get automatically cleaned up by the kernel when the process exits.
 fn get_socket_path() -> StdSocketAddr {
 	let sock_name = &get_global_config().socket_name;
 	StdSocketAddr::from_abstract_name(sock_name.as_bytes()).expect(format!("Failed to create abstract socket address: {}", sock_name).as_str())
-}
+}*/
 
 
-fn get_local_rank() -> u32 {
+/*fn get_local_rank() -> u32 {
 	get_global_config().local_rank
-}
-
+}*/
 
 /// Which node is this (between 0 and number of nodes - 1, inclusive).
-fn get_node_rank() -> u32 {
+/*fn get_node_rank() -> u32 {
 	get_global_config().node_rank
-}
-
+}*/
 
 #[derive(Deserialize, Debug)]
 struct IndexJson {
@@ -280,8 +709,7 @@ struct RawDataJson {
 	hashes: ShardHashes,
 }
 
-//#[pyclass(frozen)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct MDSShardReader {
 	remote: Url,
 	local: String,
@@ -294,32 +722,24 @@ struct MDSShardReader {
 	hashes: ShardHashes,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Serialize)]
 struct ShardHashes {
-	#[serde(deserialize_with = "hex_string_to_u128")]
+	#[serde(deserialize_with = "hex_string_to_u128", serialize_with = "u128_to_hex_string")]
 	xxh3_128: Option<u128>,
 }
 
 impl MDSShardReader {
 	/// Reads the raw data for a specific sample from this shard.
-	fn read_sample(&self, index: usize) -> anyhow::Result<Vec<u8>> {
-		let cache_dir = &GLOBAL_CONFIG.get()
-			.ok_or_else(|| anyhow::anyhow!("Global configuration not initialized. Did you call `init`?"))?
-			.cache_dir;
-
+	fn read_sample<P: AsRef<Path>>(&self, index: usize, cache_dir: P) -> anyhow::Result<Vec<u8>> {
+		let cache_dir = cache_dir.as_ref();
 		if index >= self.samples as usize {
 			bail!("Sample index {} out of bounds for shard with {} samples", index, self.samples);
 		}
 
 		// First we need to seek into the offset table to find the start and end of the desired sample.
 		let mut file = fs::File::open(cache_dir.join(&self.local)).with_context(|| format!("Failed to open shard file: {}", self.local))?;
-		file.seek(SeekFrom::Start((index as u64 + 1) * 4)).with_context(|| {
-			format!(
-				"Failed to seek to offset table for sample index {} in shard file: {}",
-				index,
-				self.local
-			)
-		})?;
+		file.seek(SeekFrom::Start((index as u64 + 1) * 4))
+			.with_context(|| format!("Failed to seek to offset table for sample index {} in shard file: {}", index, self.local))?;
 		let mut offsets: [u8; 8] = [0; 8];
 		file.read_exact(&mut offsets)
 			.with_context(|| format!("Failed to read offsets for sample index {} in shard file: {}", index, self.local))?;
@@ -346,6 +766,10 @@ impl MDSShardReader {
 		let mut reader = Cursor::new(data);
 		let mut sizes = Vec::with_capacity(self.column_sizes.len());
 
+		// Prep numpy
+		let np = py.import("numpy")?;
+		let np_frombuffer = np.getattr("frombuffer")?;
+
 		// If any columns have a size of None, we need to read the size from the data first.
 		for column_size in &self.column_sizes {
 			if let Some(column_size) = column_size {
@@ -361,7 +785,7 @@ impl MDSShardReader {
 		// Now we can read each column's data based on the sizes we have.
 		for ((column_name, encoding), size) in self.column_names.iter().zip(self.column_encodings.iter()).zip(sizes.iter()) {
 			let value = encoding
-				.decode_to_python(py, &mut reader, *size)
+				.decode_to_python(py, &mut reader, *size, &np_frombuffer)
 				.map_err(|e| PyValueError::new_err(format!("Failed to decode column '{}': {:?}", column_name, e)))?;
 			sample.set_item(column_name, value)?;
 		}
@@ -373,15 +797,17 @@ impl MDSShardReader {
 
 #[pyclass(frozen)]
 struct Stream {
+	#[allow(dead_code)]
+	remote: Url,
+	local: String,
 	shards: Vec<MDSShardReader>,
 }
 
 impl Stream {
 	/// Reads the index.json file for this stream and builds a list of information for each shard.
-	fn new(remote: &Url, local: &str) -> PyResult<Stream> {
-		let cache_dir = &get_global_config().cache_dir;
-		let local_path = Path::new(local);
-		let index_path = cache_dir.join(local).join("index.json");
+	fn new<P: AsRef<Path>>(remote: Url, local: String, cache_dir: P) -> PyResult<Stream> {
+		let local_path = Path::new(&local);
+		let index_path = cache_dir.as_ref().join(&local).join("index.json");
 
 		// Parse the index.json file to get the shard information.
 		let json: IndexJson = {
@@ -398,10 +824,13 @@ impl Stream {
 		let mut shards = Vec::new();
 
 		for shard in json.shards {
-			let shard_local = local_path.join(&shard.raw_data.basename).to_str()
+			let shard_local = local_path
+				.join(&shard.raw_data.basename)
+				.to_str()
 				.ok_or_else(|| PyValueError::new_err(format!("Local path is not valid UTF-8: {}", local_path.display())))?
 				.to_string();
-			let shard_remote = remote.join(&shard.raw_data.basename)
+			let shard_remote = remote
+				.join(&shard.raw_data.basename)
 				.map_err(|e| PyValueError::new_err(format!("Failed to join remote URL: {:?}", e)))?;
 
 			if shard.version != 2 {
@@ -415,70 +844,82 @@ impl Stream {
 			}
 
 			shards.push(MDSShardReader {
-					remote: shard_remote,
-					local: shard_local,
-					bytes: shard.raw_data.bytes,
-					samples: shard.samples,
-					column_encodings: shard.column_encodings,
-					column_names: shard.column_names,
-					column_sizes: shard.column_sizes,
-					hashes: shard.raw_data.hashes,
-				});
+				remote: shard_remote,
+				local: shard_local,
+				bytes: shard.raw_data.bytes,
+				samples: shard.samples,
+				column_encodings: shard.column_encodings,
+				column_names: shard.column_names,
+				column_sizes: shard.column_sizes,
+				hashes: shard.raw_data.hashes,
+			});
 		}
 
-		Ok(Stream {
-			shards,
-		})
+		Ok(Stream { remote, local, shards })
 	}
 }
 
 
-fn local_leader_download_indexes(remotes_and_locals: &[(Url, String)]) -> anyhow::Result<()> {
-	// create a temporary Tokio runtime to download the index files concurrently
-	// since tokio is not fork safe, and pytorch will fork the process for its workers,
-	// we need to ensure this runtime is destroyed when we're done and no global state is left behind.
-	let rt = runtime::Builder::new_current_thread()
-		.enable_all()
-		.build()
-		.expect("Failed to build Tokio runtime");
-	
-	rt.block_on(async {
-		let cache_dir = &get_global_config().cache_dir;
+fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, py: Python<'py>) -> anyhow::Result<()> {
+	let socket_addr = config.get_socket_addr();
+	let local_rank = config.local_rank as u8; // NOTE: This will wrap if the number of ranks exceeds 255, we'll want to fix that later
+	let global_rank = config.global_rank as u8; // NOTE: This will wrap if the number of ranks exceeds 255, we'll want to fix that later
 
-		// limit the number of concurrent downloads to avoid overwhelming the server
-		let download_semaphore = Arc::new(Semaphore::new(8));
+	let mut remotes_and_locals = remotes_and_locals
+		.iter()
+		.map(|(remote, local)| {
+			let remote_index = remote.join("index.json").context("Failed to construct index.json URL")?;
+			let local_index = config.cache_dir.join(local).join("index.json");
+			let local_index = local_index
+				.to_str()
+				.ok_or_else(|| anyhow::anyhow!("Local index path is not valid UTF-8: {}", local_index.display()))?
+				.to_string();
 
-		// spawn async tasks to download all the index files concurrently
-		let mut download_tasks = tokio::task::JoinSet::new();
+			Ok((remote_index, local_index))
+		})
+		.collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-		for (remote, local) in remotes_and_locals {
-			let remote_index = remote.join("index.json")
-				.context("Failed to construct index.json URL")?;
-			let local_index = cache_dir.join(local).join("index.json");
-			let download_semaphore = download_semaphore.clone();
+	// Shuffle so that if we're in a distributed setting, everyone makes different requests to maximize parallelism.
+	remotes_and_locals.shuffle(&mut rand::rng());
 
-			download_tasks.spawn(async move {
-				// if the index file already exists, we don't need to download it again.
-				if local_index.exists() {
-					println!("Index file already exists at {}, skipping download", local_index.display());
-					return Ok(());
+	// Work queue for the threads
+	let remotes_and_locals = Arc::new(Mutex::new(remotes_and_locals));
+
+	// Spawn threads to make requests to the cache server
+	// We spawn max_downloads threads, to saturate the server (which does the actual downloading and limiting).
+	// In a distributed setting, this will result in a lot of temporary threads, but that shouldn't be a big deal since this is only for downloading index files.
+	let mut threads: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+	for _ in 0..config.max_downloads {
+		let remotes_and_locals = remotes_and_locals.clone();
+		let socket_addr = socket_addr.clone();
+
+		threads.push(thread::spawn(move || {
+			let mut conn = SocketConnection::new(socket_addr, local_rank, global_rank).context("Failed to create socket connection")?;
+
+			while let Some((remote_index, local_index)) = remotes_and_locals.lock().unwrap().pop() {
+				if let Err(err) = conn.send_message(remote_index.as_str(), local_index.as_str(), None, None) {
+					eprintln!("Failed to send message to cache server: {:?}", err);
 				}
+			}
 
-				download_file(&remote_index, &local_index, None, &download_semaphore).await
-			});
+			Ok(())
+		}));
+	}
+
+	// Wait for all threads to finish
+	// Calls check_signals to ensure we handle any signals that might have been sent to the process.
+	while !threads.is_empty() {
+		py.check_signals()?;
+		thread::sleep(std::time::Duration::from_millis(100));
+
+		for i in (0..threads.len()).rev() {
+			if threads[i].is_finished() {
+				let thread = threads.remove(i);
+				thread.join().map_err(|e| anyhow::anyhow!("Thread panicked: {:?}", e))??;
+			}
 		}
-
-		while let Some(res) = download_tasks.join_next().await {
-			res.context("Failed to join download task")?
-				.context("Failed to download index file")?;
-		}
-
-		Ok::<(), anyhow::Error>(())
-	})?;
-
-	// explicitly destroy the runtime
-	// according to the tokio docs, dropping the runtime should block until the runtime is fully shut down.
-	drop(rt);
+	}
 
 	Ok(())
 }
@@ -488,62 +929,39 @@ fn local_leader_download_indexes(remotes_and_locals: &[(Url, String)]) -> anyhow
 /// This will cause the index.json files to be downloaded (if not already) and parsed.
 /// local paths must be relative paths, since they will be joined with the configured cache directory.
 /// Remote paths must be valid URLs.
-#[pyfunction]
-fn build_streams(remotes_and_locals: Vec<(String, String)>) -> PyResult<Vec<Stream>> {
-	let cache_dir = &get_global_config()
-		.cache_dir;
-
+fn build_streams<'py>(remotes_and_locals: Vec<(String, String)>, config: &Config, py: Python<'py>) -> anyhow::Result<Vec<Stream>> {
 	// parse remotes to ensure they are valid URLs
 	// and ensure locals are relative paths
-	let remotes_and_locals = remotes_and_locals.into_iter()
+	let remotes_and_locals = remotes_and_locals
+		.into_iter()
 		.map(|(remote, local)| {
 			if !Path::new(&local).is_relative() {
-				return Err(PyValueError::new_err(format!("Local path '{}' must be a relative path", local)));
+				return Err(anyhow::anyhow!("Local path '{}' must be a relative path", local));
 			}
 
 			// remotes must be directories, so ensure they end with a slash
 			// otherwise Url will treat the last part as a file name
-			let remote = if remote.ends_with('/') {
-				remote
-			} else {
-				format!("{}/", remote)
-			};
+			let remote = if remote.ends_with('/') { remote } else { format!("{}/", remote) };
 
 			let remote = Url::parse(&remote).map_err(|e| PyValueError::new_err(format!("Invalid remote URL: {}", e)))?;
 			println!("Remote mapped to URL: {}", remote);
 			Ok((remote, local))
 		})
-		.collect::<Result<Vec<_>, PyErr>>()?;
+		.collect::<anyhow::Result<Vec<_>>>()?;
 
-	// local leader will download the index files (if not already present)
-	if get_local_rank() == 0 {
-		local_leader_download_indexes(&remotes_and_locals)
-			.map_err(|e| PyValueError::new_err(format!("Failed to download index files: {:?}", e)))?;
-	}
-
-	// wait for the index files to be ready
-	// TODO: Timeout
-	for (_, local) in &remotes_and_locals {
-		let local_path = cache_dir.join(local).join("index.json");
-		loop {
-			if local_path.exists() {
-				break;
-			}
-			std::thread::sleep(std::time::Duration::from_millis(100));
-		}
-	}
+	// Download the index files (if not already present)
+	// This should only return once all index files are available.
+	download_indexes(&remotes_and_locals, config, py).context("Failed to download index files")?;
 
 	// build all the streams
-	remotes_and_locals.into_iter()
-		.map(|(remote, local)| {
-			Stream::new(&remote, &local)
-				.map_err(|e| PyValueError::new_err(format!("Failed to create Stream for {}: {:?}", local, e)))
-		})
-		.collect::<Result<Vec<_>, PyErr>>()
+	remotes_and_locals
+		.into_iter()
+		.map(|(remote, local)| Stream::new(remote, local.clone(), &config.cache_dir).with_context(|| format!("Failed to create Stream for {}", local)))
+		.collect::<anyhow::Result<Vec<_>>>()
 }
 
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Serialize)]
 enum ColumnEncoding {
 	#[serde(rename = "str")]
 	Str,
@@ -577,7 +995,7 @@ enum ColumnEncoding {
 }
 
 impl ColumnEncoding {
-	fn decode_to_python<'py, R: Read>(&self, py: Python<'py>, mut reader: R, size: u32) -> PyResult<Bound<'py, PyAny>> {
+	fn decode_to_python<'py, R: Read>(&self, py: Python<'py>, mut reader: R, size: u32, np_frombuffer: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
 		match self {
 			ColumnEncoding::Str => {
 				let mut buf = vec![0; size as usize];
@@ -585,56 +1003,35 @@ impl ColumnEncoding {
 				let value = String::from_utf8(buf).map_err(|e| PyValueError::new_err(format!("Failed to decode UTF-8 string: {:?}", e)))?;
 				Ok(PyString::new(py, &value).into_any())
 			},
-			ColumnEncoding::Int8 => {
-				let value = reader.read_i8()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Int16 => {
-				let value = reader.read_i16::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Int32 => {
-				let value = reader.read_i32::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Int64 | ColumnEncoding::Int => {
-				let value = reader.read_i64::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Uint8 => {
-				let value = reader.read_u8()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Uint16 => {
-				let value = reader.read_u16::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Uint32 => {
-				let value = reader.read_u32::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Uint64 => {
-				let value = reader.read_u64::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
+			ColumnEncoding::Int8 => numpy_frombuffer_scalar(np_frombuffer, "<i1", &mut reader, 1),
+			ColumnEncoding::Int16 => numpy_frombuffer_scalar(np_frombuffer, "<i2", &mut reader, 2),
+			ColumnEncoding::Int32 => numpy_frombuffer_scalar(np_frombuffer, "<i4", &mut reader, 4),
+			ColumnEncoding::Int64 | ColumnEncoding::Int => numpy_frombuffer_scalar(np_frombuffer, "<i8", &mut reader, 8),
+			ColumnEncoding::Uint8 => numpy_frombuffer_scalar(np_frombuffer, "<u1", &mut reader, 1),
+			ColumnEncoding::Uint16 => numpy_frombuffer_scalar(np_frombuffer, "<u2", &mut reader, 2),
+			ColumnEncoding::Uint32 => numpy_frombuffer_scalar(np_frombuffer, "<u4", &mut reader, 4),
+			ColumnEncoding::Uint64 => numpy_frombuffer_scalar(np_frombuffer, "<u8", &mut reader, 8),
 			ColumnEncoding::Bytes => {
 				let mut buf = vec![0; size as usize];
 				reader.read_exact(&mut buf)?;
 				Ok(PyBytes::new(py, &buf).into_any())
 			},
-			ColumnEncoding::Float16 => {
-				unimplemented!("Float16 decoding is not implemented yet, due to lack of support for float16 in Rust standard library");
-			},
-			ColumnEncoding::Float32 => {
-				let value = reader.read_f32::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
-			ColumnEncoding::Float64 => {
-				let value = reader.read_f64::<byteorder::LittleEndian>()?;
-				value.into_bound_py_any(py)
-			},
+			ColumnEncoding::Float16 => numpy_frombuffer_scalar(np_frombuffer, "<f2", &mut reader, 2),
+			ColumnEncoding::Float32 => numpy_frombuffer_scalar(np_frombuffer, "<f4", &mut reader, 4),
+			ColumnEncoding::Float64 => numpy_frombuffer_scalar(np_frombuffer, "<f8", &mut reader, 8),
 		}
 	}
+}
+
+
+fn numpy_frombuffer_scalar<'py, R: Read>(np_frombuffer: &Bound<'py, PyAny>, dtype: &str, reader: &mut R, size: usize) -> PyResult<Bound<'py, PyAny>> {
+	assert!(size > 0 && size <= 8, "Size must be between 1 and 8 bytes for scalar types");
+	let mut buf = [0u8; 8]; // max size is 8 bytes for scalar types
+	reader
+		.read_exact(&mut buf[..size])
+		.map_err(|e| PyIOError::new_err(format!("Failed to read {} bytes: {:?}", size, e)))?;
+	let array = np_frombuffer.call1((buf, dtype))?;
+	array.get_item(0)
 }
 
 
@@ -651,9 +1048,26 @@ where
 			if bytes.len() != 16 {
 				return Err(D::Error::custom("Hex string must be exactly 16 bytes (128 bits)"));
 			}
-			Ok(Some(u128::from_be_bytes(bytes.try_into().map_err(|_| D::Error::custom("Failed to convert bytes to u128"))?)))
+			Ok(Some(u128::from_be_bytes(
+				bytes.try_into().map_err(|_| D::Error::custom("Failed to convert bytes to u128"))?,
+			)))
 		},
 		None => Ok(None),
+	}
+}
+
+
+fn u128_to_hex_string<S>(value: &Option<u128>, serializer: S) -> Result<S::Ok, S::Error>
+where
+	S: serde::Serializer,
+{
+	match value {
+		Some(v) => {
+			let bytes = v.to_be_bytes();
+			let hex_str = hex::encode(bytes);
+			serializer.serialize_some(&hex_str)
+		},
+		None => serializer.serialize_none(),
 	}
 }
 
@@ -668,3 +1082,86 @@ where
 	}
 	Ok(())
 }*/
+
+
+#[cfg(test)]
+mod tests {
+
+	use super::ColumnEncoding;
+	use pyo3::prelude::*;
+	use std::io::Cursor;
+
+	/// Helper: call `decode_to_python` and return the raw `PyAny`
+	fn decode<'py>(py: Python<'py>, enc: ColumnEncoding, bytes: Vec<u8>, declared_size: u32) -> Bound<'py, PyAny> {
+		let np = py.import("numpy").expect("`numpy` not found – install it before running tests");
+		let frombuffer = np.getattr("frombuffer").unwrap();
+		enc.decode_to_python(py, Cursor::new(bytes), declared_size, &frombuffer).expect("decode failed")
+	}
+
+	/// Helper: unwraps the NumPy scalar back to a Rust value
+	fn extract_scalar<'py, T: FromPyObject<'py>>(obj: Bound<'py, PyAny>) -> T {
+		// `.item()` gives a pure-Python scalar that PyO3 can directly extract
+		obj.call_method0("item").unwrap().extract().unwrap()
+	}
+
+	#[test]
+	fn str_roundtrip() {
+		Python::with_gil(|py| {
+			let text = "FlowRider🚀";
+			let obj = decode(py, ColumnEncoding::Str, text.as_bytes().to_vec(), text.len() as u32);
+			assert_eq!(obj.extract::<&str>().unwrap(), text);
+		});
+	}
+
+	#[test]
+	fn bytes_roundtrip() {
+		Python::with_gil(|py| {
+			let data = b"\x00\xff\x10\x20".to_vec();
+			let obj = decode(py, ColumnEncoding::Bytes, data.clone(), data.len() as u32);
+			assert_eq!(obj.extract::<&[u8]>().unwrap(), data);
+		});
+	}
+
+	macro_rules! numeric_test {
+		($name:ident, $enc:path, $ty:ty, $val:expr) => {
+			#[test]
+			fn $name() {
+				Python::with_gil(|py| {
+					let value: $ty = $val;
+					let obj = decode(
+						py,
+						$enc,
+						value.to_le_bytes().to_vec(), // little-endian, just like the loader expects
+						std::mem::size_of::<$ty>() as u32,
+					);
+					let extracted: $ty = extract_scalar(obj);
+					assert_eq!(extracted, value);
+				});
+			}
+		};
+	}
+
+	numeric_test!(int8_scalar, ColumnEncoding::Int8, i8, -123);
+	numeric_test!(uint8_scalar, ColumnEncoding::Uint8, u8, 250);
+	numeric_test!(int16_scalar, ColumnEncoding::Int16, i16, -30000);
+	numeric_test!(uint16_scalar, ColumnEncoding::Uint16, u16, 60000);
+	numeric_test!(int32_scalar, ColumnEncoding::Int32, i32, -2_000_000_000);
+	numeric_test!(uint32_scalar, ColumnEncoding::Uint32, u32, 3_900_000_000);
+	numeric_test!(int64_scalar, ColumnEncoding::Int64, i64, -9_000_000_000);
+	numeric_test!(int_alias, ColumnEncoding::Int, i64, 42);
+	numeric_test!(uint64_scalar, ColumnEncoding::Uint64, u64, 18_446_744_073_709_551_615u64);
+	numeric_test!(float32_scalar, ColumnEncoding::Float32, f32, -1_234.5678_f32);
+	numeric_test!(float64_scalar, ColumnEncoding::Float64, f64, 8.901234567890123e55_f64);
+
+	#[test]
+	fn insufficient_buffer_returns_error() {
+		Python::with_gil(|py| {
+			let np = py.import("numpy").unwrap();
+			let frombuffer = np.getattr("frombuffer").unwrap();
+
+			let buf = vec![0_u8; 2]; // Int32 needs 4 bytes
+			let res = ColumnEncoding::Int32.decode_to_python(py, Cursor::new(buf), 4, &frombuffer);
+			assert!(res.is_err());
+		});
+	}
+}

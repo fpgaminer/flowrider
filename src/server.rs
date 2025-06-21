@@ -1,18 +1,28 @@
-use std::{io::Write, os::linux::net::SocketAddrExt, path::Path, sync::Arc};
-use anyhow::{bail, ensure, Context};
-use pyo3::{pyfunction, PyResult, Python};
-use rand::distr::SampleString;
-use tempfile::TempPath;
-use tokio::{fs, net::{UnixListener, UnixStream}, runtime, sync::Semaphore};
+use anyhow::{Context, bail, ensure};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use url::Url;
-use std::os::unix::net::UnixListener as StdUnixListener;
-use std::os::unix::net::SocketAddr as StdSocketAddr;
-use std::os::unix::net::UnixStream as StdUnixStream;
 use clap::Parser;
+use pyo3::{PyResult, Python, pyfunction};
+use rand::distr::SampleString;
+use std::{
+	io::Write,
+	os::{
+		linux::net::SocketAddrExt,
+		unix::net::{SocketAddr as StdSocketAddr, UnixListener as StdUnixListener, UnixStream as StdUnixStream},
+	},
+	path::Path,
+	sync::Arc,
+};
+use tempfile::TempPath;
+use tokio::{
+	fs,
+	io::{AsyncReadExt, AsyncWriteExt},
+	net::{UnixListener, UnixStream},
+	runtime,
+	sync::Semaphore,
+};
+use url::Url;
 
-use crate::{cache::ShardCache, get_local_rank, get_node_rank};
+use crate::cache::ShardCache;
 
 
 #[derive(Parser, Debug)]
@@ -49,32 +59,26 @@ pub fn server_entrypoint() -> PyResult<()> {
 	println!("DEBUG: Arguments: {:?}", std::env::args_os().collect::<Vec<_>>());
 
 	// if the first argument is a python interpreter, skip it
-	let args = if Path::new(&std::env::args_os().next().unwrap_or_default()).file_stem().and_then(|s| s.to_str()).map(|stem| stem.starts_with("python")).unwrap_or(false) {
+	let args = if Path::new(&std::env::args_os().next().unwrap_or_default())
+		.file_stem()
+		.and_then(|s| s.to_str())
+		.map(|stem| stem.starts_with("python"))
+		.unwrap_or(false)
+	{
 		ServerArgs::parse_from(std::env::args_os().skip(1))
 	} else {
 		ServerArgs::parse()
 	};
 
-	start_server(
-		&args.socket_name,
-		args.cache_limit,
-		args.max_downloads,
-		args.cache_dir,
-		args.worker_threads,
-	);
+	start_server(&args.socket_name, args.cache_limit, args.max_downloads, args.cache_dir, args.worker_threads);
 
 	Ok(())
 }
 
 
-pub fn start_server(
-	socket_name: &str,
-	cache_limit: u64,
-	max_downloads: usize,
-	cache_dir: String,
-	worker_threads: usize,
-) {
-	let socket_addr = StdSocketAddr::from_abstract_name(socket_name.as_bytes()).expect(format!("Failed to create abstract socket address: {}", socket_name).as_str());
+pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, cache_dir: String, worker_threads: usize) {
+	let socket_addr =
+		StdSocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap_or_else(|_| panic!("Failed to create abstract socket address: {}", socket_name));
 
 	let rt = runtime::Builder::new_multi_thread()
 		.worker_threads(worker_threads)
@@ -94,10 +98,10 @@ pub fn start_server(
 // TODO: Timeout
 pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_hash: Option<u128>, semaphore: &Semaphore) -> anyhow::Result<()> {
 	let dest_path = dest_path.as_ref();
-	let dest_parent = dest_path.parent()
+	let dest_parent = dest_path
+		.parent()
 		.ok_or_else(|| anyhow::anyhow!("Destination path must have a parent directory"))?;
-	let dest_filename = dest_path.file_name()
-		.ok_or_else(|| anyhow::anyhow!("Destination path must have a file name"))?;
+	let dest_filename = dest_path.file_name().ok_or_else(|| anyhow::anyhow!("Destination path must have a file name"))?;
 
 	// Acquire a permit from the semaphore to limit concurrent downloads
 	let _download_permit = semaphore.acquire().await.expect("Failed to acquire semaphore for download");
@@ -108,10 +112,14 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 	fs::create_dir_all(dest_parent)
 		.await
 		.context(format!("Failed to create destination directory: {}", dest_parent.display()))?;
-	
+
 	loop {
 		// random temporary file path, created in same directory as the destination to ensure renaming is atomic
-		let tmp_path = TempPath::from_path(dest_parent.join(rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16)).with_extension("tmp"));
+		let tmp_path = TempPath::from_path(
+			dest_parent
+				.join(rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 16))
+				.with_extension("tmp"),
+		);
 
 		// Download the file based on the URL scheme
 		match url.scheme() {
@@ -119,35 +127,39 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 				// for file URLs, we just symlink directly onto the destination
 				// but first, ensure destination and source are not the same
 				let src_path = url.to_file_path().map_err(|_| anyhow::anyhow!("Invalid file URL: {}", url))?;
-				let canonical_source = src_path.canonicalize()
+				let canonical_source = src_path
+					.canonicalize()
 					.context(format!("Failed to canonicalize source path: {}", src_path.display()))?;
-				let canonical_dest = dest_parent.canonicalize()
+				let canonical_dest = dest_parent
+					.canonicalize()
 					.context(format!("Failed to canonicalize destination path: {}", dest_parent.display()))?
 					.join(dest_filename);
 
-				ensure!(canonical_source != canonical_dest, "Source and destination paths must not be the same: {}", src_path.display());
+				ensure!(
+					canonical_source != canonical_dest,
+					"Source and destination paths must not be the same: {}",
+					src_path.display()
+				);
 
 				// now we can create the symlink
 				ensure!(src_path.exists(), "Source file does not exist: {}", src_path.display());
-				fs::symlink(&canonical_source, &tmp_path)
-					.await
-					.context(format!("Failed to create symlink from {} to {}", canonical_source.display(), tmp_path.display()))?;
+				fs::symlink(&canonical_source, &tmp_path).await.context(format!(
+					"Failed to create symlink from {} to {}",
+					canonical_source.display(),
+					tmp_path.display()
+				))?;
 			},
 			_ => bail!("Unsupported URL scheme: {}", url.scheme()),
 		}
 
 		// Verify the hash of the downloaded file
 		if let Some(expected_hash) = expected_hash {
-			let mut file = fs::File::open(&tmp_path)
-				.await
-				.context("Failed to open temporary file for hashing")?;
+			let mut file = fs::File::open(&tmp_path).await.context("Failed to open temporary file for hashing")?;
 			let mut hasher = xxhash_rust::xxh3::Xxh3::new();
 			let mut buffer = [0; 8192];
 
 			loop {
-				let bytes_read = file.read(&mut buffer)
-					.await
-					.context("Failed to read from temporary file")?;
+				let bytes_read = file.read(&mut buffer).await.context("Failed to read from temporary file")?;
 				if bytes_read == 0 {
 					break; // EOF
 				}
@@ -156,18 +168,21 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 
 			let hash = hasher.digest128();
 			if hash != expected_hash {
-				eprintln!("Warning: Hash mismatch for downloaded file {}. Expected: {:032x}, got: {:032x}. Will retry download.", 
-					tmp_path.display(), expected_hash, hash);
+				eprintln!(
+					"Warning: Hash mismatch for downloaded file {}. Expected: {:032x}, got: {:032x}. Will retry download.",
+					tmp_path.display(),
+					expected_hash,
+					hash
+				);
 				continue;
 			}
 		}
 
 		// File downloaded successfully and hash verified, now we can move it to the destination path
 		// Move the temporary file to the destination path atomically
-		tmp_path.persist(dest_path)
-			.context("Failed to persist temporary file")?;
+		tmp_path.persist(dest_path).context("Failed to persist temporary file")?;
 
-		return Ok(())
+		return Ok(());
 	}
 }
 
@@ -199,15 +214,17 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 				Err(e) => {
 					eprintln!("Failed to read client rank: {}", e);
 					return;
-				}
+				},
 			};
 			let client_node = client_ranks >> 24;
 			let client_rank = (client_ranks >> 16) & 0xFF;
 			let client_worker_id = client_rank & 0xFFFF;
 
 			if let Err(e) = handle_connection(stream, cache, download_semaphore).await {
-				eprintln!("an error occurred while handling connection from node={},rank={},worker={}: {:?}", 
-					client_node, client_rank, client_worker_id, e);
+				eprintln!(
+					"an error occurred while handling connection from node={},rank={},worker={}: {:?}",
+					client_node, client_rank, client_worker_id, e
+				);
 			}
 		});
 	}
@@ -227,25 +244,26 @@ async fn handle_connection(mut stream: UnixStream, cache: ShardCache, download_s
 		};
 
 		// sanity check: ensure the message length is within reasonable limits
-		ensure!(message_len <= (131072 + 4 + 16), "Received message length {} exceeds maximum allowed size", message_len);
+		ensure!(
+			message_len <= (131072 + 4 + 16),
+			"Received message length {} exceeds maximum allowed size",
+			message_len
+		);
 
 		buf.resize(message_len as usize, 0);
 		stream.read_exact(&mut buf).await?;
 
 		// Payload format: remote_uri (string), local_path (string), expected_hash (u128)
 		let mut cursor = std::io::Cursor::new(&buf);
-		let remote = read_string(&mut cursor)
-			.context("Failed to read remote URI")?;
-		let local = read_string(&mut cursor)
-			.context("Failed to read local path")?;
-		let expected_hash = ReadBytesExt::read_u128::<byteorder::LittleEndian>(&mut cursor)
-			.context("Failed to read expected hash")?;
-
+		let remote = read_string(&mut cursor).context("Failed to read remote URI")?;
+		let local = read_string(&mut cursor).context("Failed to read local path")?;
+		let expected_hash = ReadBytesExt::read_u128::<byteorder::LittleEndian>(&mut cursor).context("Failed to read expected hash")?;
 		println!("Received request for {} -> {} ({:032x})", remote, local, expected_hash);
+		let expected_hash = if expected_hash == 0 { None } else { Some(expected_hash) };
+
 
 		// parse remote URI
-		let remote_uri = Url::parse(&remote)
-			.context(format!("Failed to parse remote URI: {}", remote))?;
+		let remote_uri = Url::parse(&remote).context(format!("Failed to parse remote URI: {}", remote))?;
 
 		// local path must be a relative path, since it will be joined with the cache directory
 		ensure!(Path::new(&local).is_relative(), "Local path '{}' must be a relative path", local);
@@ -253,8 +271,7 @@ async fn handle_connection(mut stream: UnixStream, cache: ShardCache, download_s
 		// Get shard from cache
 		// If it isn't in the cache, this will trigger a download
 		// Once this returns, we can assume the shard is available at its local path (at least for awhile).
-		cache.get_shard(remote_uri, &local, expected_hash, &download_semaphore)
-			.await?;
+		cache.get_shard(remote_uri, &local, expected_hash, &download_semaphore).await?;
 
 		stream.write_u8(1u8).await?;
 	}
@@ -275,23 +292,24 @@ fn read_string<R: std::io::Read>(reader: &mut R) -> anyhow::Result<String> {
 }
 
 
-
 pub struct SocketConnection {
 	stream: StdUnixStream,
+	addr: StdSocketAddr, // The address of the server we are connected to.
 	in_progress: bool,
 	pid: u32, // Process ID of the process that created this connection. Used to detect forks.
+	local_rank: u8,
+	global_rank: u8,
 }
 
-fn connect_to_server(addr: &StdSocketAddr) -> anyhow::Result<StdUnixStream> {
-	let local_rank: u8 = get_local_rank().try_into().expect("expected local rank to fit in u8");
-	let node_rank: u8 = get_node_rank().try_into().expect("expected node rank to fit in u8");
+fn connect_to_server(addr: &StdSocketAddr, local_rank: u8, global_rank: u8) -> anyhow::Result<StdUnixStream> {
 	// TODO: Worker process ID?
-	let ranks = (node_rank as u32) << 24 | (local_rank as u32) << 16;
+	let ranks = (global_rank as u32) << 24 | (local_rank as u32) << 16;
 
 	loop {
 		match StdUnixStream::connect_addr(addr) {
 			Ok(mut stream) => {
-				stream.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+				stream
+					.set_read_timeout(Some(std::time::Duration::from_secs(1)))
 					.map_err(|e| anyhow::anyhow!("Failed to set read timeout: {}", e))?;
 
 				// introduce ourselves to the server
@@ -300,7 +318,7 @@ fn connect_to_server(addr: &StdSocketAddr) -> anyhow::Result<StdUnixStream> {
 					std::thread::sleep(std::time::Duration::from_millis(1000));
 					continue;
 				}
-				
+
 				return Ok(stream);
 			},
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -310,20 +328,22 @@ fn connect_to_server(addr: &StdSocketAddr) -> anyhow::Result<StdUnixStream> {
 			Err(e) => {
 				eprintln!("Failed to connect to socket at {:?} (will retry): {}", addr, e);
 				std::thread::sleep(std::time::Duration::from_millis(1000));
-			}
+			},
 		}
 	}
 }
 
 impl SocketConnection {
-	pub fn new(addr: StdSocketAddr) -> anyhow::Result<Self> {
-		let stream = connect_to_server(&addr)
-			.context("Failed to connect to server")?;
+	pub fn new(addr: StdSocketAddr, local_rank: u8, global_rank: u8) -> anyhow::Result<Self> {
+		let stream = connect_to_server(&addr, local_rank, global_rank).context("Failed to connect to server")?;
 
 		Ok(SocketConnection {
 			stream,
+			addr,
 			in_progress: false,
 			pid: std::process::id(),
+			local_rank,
+			global_rank,
 		})
 	}
 
@@ -332,19 +352,19 @@ impl SocketConnection {
 	/// `remote_uri` must fit in a u16, so it must be less than 65536 bytes.
 	/// `local_path` must also fit in a u16, so it must be less than 65536 bytes.
 	/// The server is always expected to respond with 1.
-	pub fn send_message<'py>(&mut self, remote_uri: &str, local_path: &str, expected_hash: u128, py: Python<'py>) -> anyhow::Result<u8> {
+	pub fn send_message<'py>(&mut self, remote_uri: &str, local_path: &str, expected_hash: Option<u128>, py: Option<Python<'py>>) -> anyhow::Result<u8> {
 		if self.pid != std::process::id() {
 			// If the PID has changed, we need to re-establish the connection.
-			self.stream = connect_to_server(&self.stream.local_addr()
-				.map_err(|e| anyhow::anyhow!("Failed to get local address: {}", e))?)
-				.context("Failed to reconnect to server")?;
+			self.stream = connect_to_server(&self.addr, self.local_rank, self.global_rank).context("Failed to reconnect to server")?;
 			self.in_progress = false;
 			println!("Reconnected to server after fork, PID changed from {} to {}", self.pid, std::process::id());
 			self.pid = std::process::id();
 		}
 
 		if self.in_progress {
-			return Err(anyhow::anyhow!("A message was already in progress, this means the connection is in an inconsistent state. Please reconnect."));
+			return Err(anyhow::anyhow!(
+				"A message was already in progress, this means the connection is in an inconsistent state. Please reconnect."
+			));
 		}
 
 		// TODO: Timeout
@@ -365,7 +385,7 @@ impl SocketConnection {
 		buf.extend_from_slice(local_path.as_bytes());
 
 		// Write the expected hash
-		WriteBytesExt::write_u128::<byteorder::LittleEndian>(&mut buf, expected_hash)?;
+		WriteBytesExt::write_u128::<byteorder::LittleEndian>(&mut buf, expected_hash.unwrap_or(0))?;
 
 		// Send the message
 		self.in_progress = true;
@@ -374,7 +394,9 @@ impl SocketConnection {
 		// Wait for a response (1 byte)
 		// We use a loop with a short read timeout so we can repeatedly call `check_signals` in the loop to handle ctrl+c, etc.
 		let response = loop {
-			py.check_signals()?;
+			if let Some(py) = py {
+				py.check_signals()?;
+			}
 
 			match self.stream.read_u8() {
 				Ok(response) => {
@@ -385,7 +407,7 @@ impl SocketConnection {
 				},
 				Err(e) => {
 					return Err(anyhow::anyhow!("Failed to read response from server: {}", e));
-				}
+				},
 			}
 		};
 		self.in_progress = false;

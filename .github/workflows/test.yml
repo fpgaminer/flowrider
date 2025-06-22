@@ -38,6 +38,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip
+        run: python -m pip install numpy
       - run: cargo test --no-default-features --features auto-initialize
   
   python-wheel:
@@ -52,6 +55,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Set PYTHON for PyO3
+        run: echo "PYO3_PYTHON=${pythonLocation}/bin/python" >> $GITHUB_ENV
       - name: Install build dependencies
         run: |
           python -m pip install --upgrade pip

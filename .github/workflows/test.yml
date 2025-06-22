@@ -1,0 +1,85 @@
+name: Test
+on:
+  pull_request:
+  push:
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --all-features
+  
+  fmt:
+    name: Check formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+  
+  clippy:
+    name: Check for linting errors
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-features -- -D warnings
+  
+  test:
+    name: Run test suite
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-features
+  
+  python-wheel:
+    name: Test wheel building
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ["3.10"]   # could add more versions here
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "setuptools>=48" wheel "setuptools-rust>=1.0" numpy
+      - name: pip install .
+        env:
+          # Guarantees PyO3 uses *this* interpreter when it looks for headers/libs
+          PYO3_PYTHON: ${{ env.pythonLocation || steps.setup-python.outputs.python-path }}
+        run: |
+          python -m pip install .
+
+      - name: Smoke-test import
+        run: |
+          python - << 'PY'
+          import importlib, sys, pathlib, textwrap
+          import flowrider                           # ← if this fails, the wheel is broken
+          print("flowrider imported from", flowrider.__file__)
+          # ultra-light sanity check: construct a Config and print it
+          cfg = flowrider.Config(
+              cache_dir="tmp_cache",
+              cache_limit=0,
+              max_downloads=1,
+              num_cache_workers=None,
+              local_rank=0,
+              global_rank=0,
+              world_size=1,
+              master_addr=None,
+              master_port=None,
+          )
+          print("Constructed Config OK:", cfg)
+          PY

@@ -96,7 +96,7 @@ impl ShardCache {
 				};
 
 				let meta = Arc::new(ShardMeta {
-					bytes: metadata.len() as u32,
+					bytes: metadata.len().try_into().unwrap_or(u32::MAX),
 					remote: None,
 				});
 				self.cache.insert(local.to_string(), meta).await;
@@ -229,7 +229,9 @@ async fn download_shard(remote: &Url, local: &str, expected_hash: Option<u128>, 
 	let bytes = tokio::fs::metadata(local)
 		.await
 		.context(format!("Failed to get metadata for shard at {}", local))?
-		.len() as u32;
+		.len()
+		.try_into()
+		.context(format!("Shard at {} is too large", local))?;
 	let meta = Arc::new(ShardMeta {
 		bytes,
 		remote: Some(remote.clone()),

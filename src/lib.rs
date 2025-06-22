@@ -243,7 +243,7 @@ struct StreamingDataset {
 	shards: Vec<MDSShardReader>,
 	shards_cum: Vec<u64>,
 	stream_ranges: Vec<(u64, u64)>, // [start, end) for each stream (in global sample indices)
-	conn: std::sync::Mutex<SocketConnection>,
+	conn: SocketConnection,
 
 	seed: Vec<u8>,
 	shuffle: bool,
@@ -304,10 +304,8 @@ impl StreamingDataset {
 		}
 
 		// connection to the cache server
-		let conn = std::sync::Mutex::new(
-			SocketConnection::new(config.get_socket_addr(), config.global_rank as u16, 0, Some(py))
-				.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?,
-		);
+		let conn = SocketConnection::new(config.get_socket_addr(), config.global_rank as u16)
+			.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?;
 
 		Ok(StreamingDataset {
 			shards,
@@ -349,8 +347,6 @@ impl StreamingDataset {
 
 		// ask the cache server to make the shard available
 		self.conn
-			.lock()
-			.map_err(|e| PyIOError::new_err(format!("Failed to lock cache connection: {:?}", e)))?
 			.send_message(shard.remote.as_str(), &shard.local, Some(shard_hash), Some(py), worker_id)
 			.map_err(|e| PyIOError::new_err(format!("Failed to send message to cache server: {:?}", e)))?;
 
@@ -417,7 +413,7 @@ impl StreamingDataset {
 
 	/// Called to unpickle the object.
 	#[staticmethod]
-	fn __setstate__<'py>(state: Bound<'_, PyDict>, py: Python<'py>) -> PyResult<StreamingDataset> {
+	fn __setstate__(state: Bound<'_, PyDict>) -> PyResult<StreamingDataset> {
 		#[derive(Deserialize)]
 		struct StreamingDatasetState {
 			shards: Vec<MDSShardReader>,
@@ -433,10 +429,8 @@ impl StreamingDataset {
 		let snapshot: StreamingDatasetState =
 			depythonize(&state).map_err(|e| PyValueError::new_err(format!("Failed to depythonize StreamingDataset state: {:?}", e)))?;
 
-		let conn = Mutex::new(
-			SocketConnection::new(snapshot.config.get_socket_addr(), snapshot.config.global_rank as u16, 0, Some(py))
-				.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?,
-		);
+		let conn = SocketConnection::new(snapshot.config.get_socket_addr(), snapshot.config.global_rank as u16)
+			.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?;
 
 		Ok(StreamingDataset {
 			shards: snapshot.shards,
@@ -671,7 +665,7 @@ fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, 
 		let socket_addr = socket_addr.clone();
 
 		threads.push(thread::spawn(move || {
-			let mut conn = SocketConnection::new(socket_addr, global_rank, 0, None).context("Failed to create socket connection")?;
+			let conn = SocketConnection::new(socket_addr, global_rank).context("Failed to create socket connection")?;
 
 			while let Some((remote_index, local_index)) = remotes_and_locals.lock().unwrap().pop() {
 				if let Err(err) = conn.send_message(remote_index.as_str(), local_index.as_str(), None, None, 0) {

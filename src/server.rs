@@ -1,7 +1,7 @@
 use anyhow::{Context, bail, ensure};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use log::{error, info, warn};
-use pyo3::Python;
+use pyo3::{Python, sync::MutexExt};
 use rand::distr::SampleString;
 use s3::Bucket;
 use std::{
@@ -284,15 +284,12 @@ fn read_string<R: std::io::Read>(reader: &mut R) -> anyhow::Result<String> {
 
 
 pub struct SocketConnection {
-	stream: StdUnixStream,
-	addr: StdSocketAddr, // The address of the server we are connected to.
-	in_progress: bool,
-	pid: u32, // Process ID of the process that created this connection. Used to detect forks.
+	addr: StdSocketAddr, // The address of the server we connect to.
 	global_rank: u16,
+	inner: std::sync::Mutex<Option<(StdUnixStream, u32)>>, // (stream, pid); Process ID of the process that created the connection. Used to detect forks.
 }
 
 fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16, py: Option<Python<'py>>) -> anyhow::Result<StdUnixStream> {
-	// TODO: Worker process ID?
 	let ranks = (global_rank as u32) << 16 | (worker_id as u32);
 
 	loop {
@@ -326,44 +323,34 @@ fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16
 }
 
 impl SocketConnection {
-	pub fn new<'py>(addr: StdSocketAddr, global_rank: u16, worker_id: u16, py: Option<Python<'py>>) -> anyhow::Result<Self> {
-		let stream = connect_to_server(&addr, global_rank, worker_id, py).context("Failed to connect to server")?;
-
+	pub fn new(addr: StdSocketAddr, global_rank: u16) -> anyhow::Result<Self> {
 		Ok(SocketConnection {
-			stream,
 			addr,
-			in_progress: false,
-			pid: std::process::id(),
 			global_rank,
+			inner: std::sync::Mutex::new(None),
 		})
 	}
 
 	/// Sends a message to the server and waits for a response.
-	/// Will set `in_progress` to true while the message is being sent, and false after the response is received, so we can keep track of whether a message is in progress.
+	/// Cannot be used concurrently.
 	/// `remote_uri` must fit in a u16, so it must be less than 65536 bytes.
 	/// `local_path` must also fit in a u16, so it must be less than 65536 bytes.
 	/// The server is always expected to respond with 1.
 	pub fn send_message<'py>(
-		&mut self,
+		&self,
 		remote_uri: &str,
 		local_path: &str,
 		expected_hash: Option<u128>,
 		py: Option<Python<'py>>,
 		worker_id: u16,
 	) -> anyhow::Result<u8> {
-		if self.pid != std::process::id() {
-			// If the PID has changed, we need to re-establish the connection.
-			self.stream = connect_to_server(&self.addr, self.global_rank, worker_id, py).context("Failed to reconnect to server")?;
-			self.in_progress = false;
-			info!("Reconnected to server after fork, PID changed from {} to {}", self.pid, std::process::id());
-			self.pid = std::process::id();
+		// Prevent concurrent usage.
+		let mut guard = if let Some(py) = py {
+			self.inner.lock_py_attached(py)
+		} else {
+			self.inner.lock()
 		}
-
-		if self.in_progress {
-			return Err(anyhow::anyhow!(
-				"A message was already in progress, this means the connection is in an inconsistent state. Please reconnect."
-			));
-		}
+		.map_err(|e| anyhow::anyhow!("Failed to lock socket connection: {:?}", e))?;
 
 		// TODO: Timeout
 		let mut buf = Vec::new();
@@ -385,16 +372,25 @@ impl SocketConnection {
 		// Write the expected hash
 		WriteBytesExt::write_u128::<byteorder::LittleEndian>(&mut buf, expected_hash.unwrap_or(0))?;
 
+		// We pull the connection out of the Mutex<Option<>>.  If anything goes wrong, the connection may be left in an inconsistent state.
+		// By taking the connection, we know it'll be dropped if anything goes wrong, and we can re-establish it on the next call.
+		let (mut stream, pid) = match guard.take() {
+			Some((stream, pid)) if pid == std::process::id() => (stream, pid), // Reuse existing connection if PID matches.
+			_ => {
+				let stream = connect_to_server(&self.addr, self.global_rank, worker_id, py).context("Failed to connect to server")?;
+				(stream, std::process::id())
+			},
+		};
+
 		// Send the message
-		self.in_progress = true;
-		self.stream.write_all(&buf)?;
+		stream.write_all(&buf)?;
 
 		// Wait for a response (1 byte)
 		// We use a loop with a short read timeout so we can repeatedly call `check_signals` in the loop to handle ctrl+c, etc.
 		let response = loop {
 			py.check_signals()?;
 
-			match py.allow_threads(|| self.stream.read_u8()) {
+			match py.allow_threads(|| stream.read_u8()) {
 				Ok(response) => {
 					break response;
 				},
@@ -402,11 +398,13 @@ impl SocketConnection {
 					continue;
 				},
 				Err(e) => {
-					return Err(anyhow::anyhow!("Failed to read response from server: {}", e));
+					return Err(e).context("Failed to read response from server");
 				},
 			}
 		};
-		self.in_progress = false;
+
+		// Put the connection back in the Mutex<Option<>>.
+		*guard = Some((stream, pid));
 
 		Ok(response)
 	}

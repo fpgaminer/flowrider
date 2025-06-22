@@ -15,4 +15,3 @@ Inspired by MosaicML's `streaming` library (https://github.com/mosaicml/streamin
 ## TODO:
 
 - Right now we use filehash=0 as a sigil for "we don't care about the filehash".  The filehash is 128-bits so it doesn't matter in practice, but it's hacky so we should fix that and modify the protocol to support an optional filehash directly.
-- Make SocketConnection lazy connect

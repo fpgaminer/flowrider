@@ -1,5 +1,6 @@
 use anyhow::{Context, ensure};
 use async_recursion::async_recursion;
+use log::{info, warn};
 use moka::future::{Cache, FutureExt};
 use std::{
 	path::{Path, PathBuf},
@@ -36,7 +37,7 @@ impl ShardCache {
 					}
 
 					if let Err(err) = tokio::fs::remove_file(Path::new(&*key)).await {
-						eprintln!("Warning: Failed to remove file {}: {}", key, err);
+						warn!("Cache failed to remove file {}: {}", key, err);
 					}
 				}
 				.boxed()
@@ -51,9 +52,9 @@ impl ShardCache {
 		let this = ShardCache { cache, cache_dir };
 
 		// find existing shards in the cache directory and pre-populate the cache
-		println!("Populating shard cache from {}", this.cache_dir.display());
+		info!("Populating shard cache from {}", this.cache_dir.display());
 		this.populate_cache(&this.cache_dir).await;
-		println!("Shard cache populated");
+		info!("Shard cache populated");
 
 		this
 	}
@@ -65,7 +66,7 @@ impl ShardCache {
 		}
 
 		let Ok(mut entries) = tokio::fs::read_dir(path).await.inspect_err(|e| {
-			eprintln!("Warning: Failed to read directory {}: {}", path.display(), e);
+			warn!("Failed to read directory {}: {:?}", path.display(), e);
 		}) else {
 			return;
 		};
@@ -73,23 +74,23 @@ impl ShardCache {
 		while let Some(entry) = match entries.next_entry().await {
 			Ok(e) => e,
 			Err(e) => {
-				eprintln!("Warning: Failed to read entry in directory {}: {}", path.display(), e);
+				warn!("Failed to read entry in directory {}: {:?}", path.display(), e);
 				return;
 			},
 		} {
 			let path = entry.path();
 			if path.is_file() && path.extension().is_some_and(|ext| ext == "mds") {
 				let Ok(local_path) = path.canonicalize() else {
-					eprintln!("Warning: Failed to canonicalize path {}. Skipping.", path.display());
+					warn!("Failed to canonicalize path {:?}. Skipping.", path.display());
 					continue;
 				};
 				let Some(local) = local_path.to_str() else {
-					eprintln!("Warning: Path {} is not valid UTF-8. Skipping.", local_path.display());
+					warn!("Path {} is not valid UTF-8. Skipping.", local_path.display());
 					continue;
 				};
 
 				let Ok(metadata) = tokio::fs::metadata(&path).await else {
-					eprintln!("Warning: Failed to get metadata for path {}. Skipping.", path.display());
+					warn!("Failed to get metadata for path {}. Skipping.", path.display());
 					continue;
 				};
 
@@ -113,6 +114,15 @@ impl ShardCache {
 			"Local path '{}' is not valid. It must be a relative path without traversal components, must have a file name, and must not be empty.",
 			local
 		);
+
+		// Check for footgun
+		if self.cache_dir.components().zip(Path::new(local).components()).all(|(a, b)| a == b) {
+			return Err(anyhow::anyhow!(
+				"A shard was requested with local path '{}', but that starts with the cache directory '{}'. This is likely a mistake, and could mean something is broken with this code. Please report this issue.",
+				local,
+				self.cache_dir.display()
+			));
+		}
 
 		let local_cache_path = self.cache_dir.join(local);
 
@@ -162,7 +172,7 @@ impl ShardCache {
 						remote
 					);
 				}
-				println!("Using cached shard at {}", local);
+				info!("Using cached shard at {}", local);
 				Ok(meta)
 			},
 			Err(e) => Err(anyhow::anyhow!("Failed to get shard {}: {}", local, e)),
@@ -225,7 +235,7 @@ async fn download_shard(remote: &Url, local: &str, expected_hash: Option<u128>, 
 	});
 
 	let elapsed = start.elapsed();
-	println!("Downloaded shard {} in {:?}", local, elapsed);
+	info!("Downloaded shard {} in {:?}", local, elapsed);
 
 	Ok(meta)
 }

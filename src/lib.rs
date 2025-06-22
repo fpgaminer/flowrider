@@ -16,10 +16,11 @@ use std::{
 
 use anyhow::{Context, bail};
 use byteorder::ReadBytesExt;
-use ndarray::prelude::*;
+use log::{error, info};
 use numpy::{IntoPyArray, PyArray1};
 use pyo3::{
 	exceptions::{PyIOError, PyValueError},
+	marker::Ungil,
 	prelude::*,
 	types::{PyBytes, PyDict, PyString},
 };
@@ -38,33 +39,16 @@ use crate::server::{SocketConnection, start_server};
 const DEFAULT_NUM_CACHE_WORKERS: usize = 8;
 
 
-/*struct GlobalConfig {
-	local_rank: u32,
-	node_rank: u32,
-	#[allow(dead_code)]
-	world_size: u32,
-	socket_name: String,
-	cache_dir: PathBuf,
-}*/
-
-//static GLOBAL_CONFIG: std::sync::OnceLock<GlobalConfig> = std::sync::OnceLock::new();
-//static SOCKET_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-//static CACHE_SERVER_RUNNING: std::sync::Once = std::sync::Once::new();
 /// The PID of the process we were initialized in.  This should mitigate some weird forking issues.  If a forked process tries to use this module, it will still reference the original process's PID, enabling it
 /// to find the cache server socket.
 static INITIAL_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
-/// Configuration the cache server was started with.  Used to warn the user if they try to use a different cache directory or socket name after the server has started.
-/// Also used to ensure that the cache server is only started once per node.
-//static CACHE_SERVER_CONFIG: std::sync::OnceLock<(PathBuf, String)> = std::sync::OnceLock::new();
-
-/*fn get_global_config() -> &'static GlobalConfig {
-	GLOBAL_CONFIG.get().expect("Global configuration not initialized. Did you call `init`?")
-}*/
 
 #[pymodule]
 fn flowrider(m: &Bound<'_, PyModule>) -> PyResult<()> {
-	pyo3_log::init();
+	env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+		.format_timestamp_millis()
+		.init();
 
 	INITIAL_PID
 		.set(std::process::id())
@@ -76,96 +60,6 @@ fn flowrider(m: &Bound<'_, PyModule>) -> PyResult<()> {
 	Ok(())
 }
 
-
-/// This function must be called before using any other functionality in this module.
-/// cache_limit: The maximum size of the cache in bytes.
-/// max_downloads: The maximum number of concurrent downloads allowed.
-/// local_rank: The rank of this process on the local node (0 for the first process).
-/// node_rank: The rank of this process in the distributed group (between 0 and number of nodes - 1).  (Usually GROUP_RANK)
-/// world_size: The total number of processes in the distributed group.
-/// master_addr: The address of the master node (usually MASTER_ADDR).
-/// master_port: The port of the master node (usually MASTER_PORT).
-///
-/// If running on a single rank (no distributed training), set `local_rank` and `node_rank` to 0 and `world_size` to 1; master_addr and master_port can be None.
-///
-/// A unique socket name will be generated based on the master address and port, or the process ID if they are not set. This is used to communicate with the cache server.
-/*#[pyfunction]
-fn init(
-	cache_limit: u64,
-	max_downloads: usize,
-	local_rank: u32,
-	node_rank: u32,
-	world_size: u32,
-	cache_dir: &str,
-	master_addr: Option<&str>,
-	master_port: Option<u16>,
-) {
-	// create a socket name unique to this run, based on the master address and port, or the process ID if they are not set (non-distributed case).
-	let socket_name = match (master_addr, master_port) {
-		(Some(addr), Some(port)) => {
-			let run_hash = xxhash_rust::xxh3::xxh3_128(format!("{}:{}", addr, port).as_bytes());
-			format!("flowrider-socket-{:032x}", run_hash)
-		},
-		(None, None) => {
-			let run_hash = xxhash_rust::xxh3::xxh3_128(format!("pid={}", std::process::id()).as_bytes());
-			format!("flowrider-socket-{:032x}", run_hash)
-		},
-		_ => panic!("master_addr and master_port must both be set or both be None"),
-	};
-	let config = GlobalConfig {
-		local_rank,
-		node_rank,
-		world_size,
-		socket_name: socket_name.clone(),
-		cache_dir: PathBuf::from(cache_dir),
-	};
-
-	if GLOBAL_CONFIG.set(config).is_err() {
-		panic!("Global configuration already initialized. Please ensure you call `init` only once per process.");
-	}
-
-	// We only want to spawn the flowrider server once (per node), so it's hidden after the panic check above and only spawnned on the local leader
-	if local_rank == 0 {
-		println!("Spawning flowrider server...");
-		/*let exe_dir = std::env::current_exe()
-			.expect("Failed to get current executable directory")
-			.parent()
-			.expect("Failed to get parent directory of executable")
-			.join("flowrider-server");
-		//let server_path = exe_dir.join("flowrider-server");
-
-		unsafe {
-			let _child = Command::new(exe_dir)
-				.args(["--socket-name", &socket_name, "--cache-limit", &cache_limit.to_string(), "--max-downloads", &max_downloads.to_string(), "--cache-dir", cache_dir])
-				.stdout(Stdio::inherit())
-				.stderr(Stdio::inherit())
-				.pre_exec(move || {
-					// this code runs inside the child process just after fork and before execve
-					// we want to as kthe kernel to kill us when the original process dies
-					// to ensure we don't leave behind a zombie server
-					if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-						return Err(std::io::Error::last_os_error());
-					}
-					if libc::getppid() == 1 {
-						// parent vanished between fork and here - bail out!
-						return Err(std::io::Error::new(std::io::ErrorKind::Other, "parent died before exec"));
-					}
-					Ok(())
-				})
-				.spawn()
-				.expect("Failed to spawn flowrider server process");
-		}*/
-
-		let cache_dir = cache_dir.to_owned();
-		let socket_name = socket_name.clone();
-		std::thread::spawn(move || {
-			// This will block until the server is stopped.
-			start_server(&socket_name, cache_limit, max_downloads, cache_dir, 8); // todo: number of workers
-		});
-
-		println!("Flowrider server spawned successfully.");
-	}
-}*/
 
 #[pyclass(frozen, str)]
 #[derive(Clone, Serialize, Deserialize)]
@@ -218,9 +112,7 @@ impl Config {
 		let local_rank = local_rank
 			.or_else(|| env::var("LOCAL_RANK").ok().and_then(|s| s.parse::<u32>().ok()))
 			.unwrap_or(0);
-		let global_rank = global_rank
-			.or_else(|| env::var("GROUP_RANK").ok().and_then(|s| s.parse::<u32>().ok()))
-			.unwrap_or(0);
+		let global_rank = global_rank.or_else(|| env::var("RANK").ok().and_then(|s| s.parse::<u32>().ok())).unwrap_or(0);
 		let world_size = world_size
 			.or_else(|| env::var("WORLD_SIZE").ok().and_then(|s| s.parse::<u32>().ok()))
 			.unwrap_or(1);
@@ -277,35 +169,7 @@ impl Config {
 		let server_config = match tempfile.persist_noclobber(&server_config_path) {
 			Ok(_) => {
 				// We won the race - spawn the server
-				println!("Spawning flowrider server...");
-				/*let exe_dir = std::env::current_exe()
-					.expect("Failed to get current executable directory")
-					.parent()
-					.expect("Failed to get parent directory of executable")
-					.join("flowrider-server");
-				//let server_path = exe_dir.join("flowrider-server");
-
-				unsafe {
-					let _child = Command::new(exe_dir)
-						.args(["--socket-name", &socket_name, "--cache-limit", &cache_limit.to_string(), "--max-downloads", &max_downloads.to_string(), "--cache-dir", cache_dir])
-						.stdout(Stdio::inherit())
-						.stderr(Stdio::inherit())
-						.pre_exec(move || {
-							// this code runs inside the child process just after fork and before execve
-							// we want to as kthe kernel to kill us when the original process dies
-							// to ensure we don't leave behind a zombie server
-							if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-								return Err(std::io::Error::last_os_error());
-							}
-							if libc::getppid() == 1 {
-								// parent vanished between fork and here - bail out!
-								return Err(std::io::Error::new(std::io::ErrorKind::Other, "parent died before exec"));
-							}
-							Ok(())
-						})
-						.spawn()
-						.expect("Failed to spawn flowrider server process");
-				}*/
+				info!("Spawning flowrider server...");
 
 				let server_config_path = TempPath::from_path(&server_config_path);
 				let cache_dir_clone = cache_dir.to_owned();
@@ -318,7 +182,7 @@ impl Config {
 					drop(server_config_path);
 				});
 
-				println!("Flowrider server spawned successfully.");
+				info!("Flowrider server spawned successfully.");
 
 				cache_dir.to_owned()
 			},
@@ -393,83 +257,6 @@ impl StreamingDataset {
 	fn total_samples(&self) -> u64 {
 		*self.shards_cum.last().unwrap_or(&0)
 	}
-
-	/// Based on the parameters, returns a list of global sample indices that this device should process in the specified epoch.
-	fn get_my_work(&self, seed: &[u8], epoch: u64, shuffle: bool, drop_last: bool, micro_batch_size: usize) -> Vec<i64> {
-		println!(
-			"[{}] Getting work for epoch {} with seed {:?}, shuffle: {}, drop_last: {}, micro_batch_size: {}",
-			self.config.local_rank, epoch, seed, shuffle, drop_last, micro_batch_size
-		);
-		let world_size = self.config.world_size as usize;
-		let global_rank = self.config.global_rank as usize;
-		let total_samples = self.total_samples() as usize;
-		let mut ids = Vec::with_capacity(total_samples);
-
-		// Deterministic shuffling based on the seed and epoch.
-		let seed1 = xxh3_128(seed);
-		let seed2 = xxh3_128(&epoch.to_le_bytes());
-		let mut seed = [0u8; 32];
-		seed[..16].copy_from_slice(&seed1.to_le_bytes());
-		seed[16..].copy_from_slice(&seed2.to_le_bytes());
-		let mut rng = ChaCha8Rng::from_seed(seed);
-
-		// We start by going through each stream, because batches cannot contain samples from different streams.
-		for (sample_begin, sample_end) in &self.stream_ranges {
-			// get a list of all sample IDs in this stream, shuffled if requested.
-			let stream_samples = sample_end - sample_begin;
-			let mut stream_ids = if shuffle {
-				sample(&mut rng, stream_samples as usize, stream_samples as usize)
-					.into_iter()
-					.map(|i| i as i64 + *sample_begin as i64)
-					.collect::<Vec<_>>()
-			} else {
-				((*sample_begin as i64)..(*sample_end as i64)).collect::<Vec<_>>()
-			};
-
-			// Pad or truncate to a multiple of the micro batch size
-			let remainder = stream_ids.len() % micro_batch_size;
-			if remainder > 0 && drop_last {
-				stream_ids.truncate(stream_ids.len() - remainder);
-			} else if remainder > 0 {
-				let padding = micro_batch_size - remainder;
-				stream_ids.extend((0..padding).map(|_| -1)); // Use -1 to indicate padding
-			}
-
-			// Add the stream IDs to the main list.
-			ids.extend(stream_ids.into_iter());
-		}
-
-		// At this point ids is already a multiple of micro_batch_size, but we'll also want it to divide evenly by the number of devices.
-		let n = micro_batch_size * world_size;
-		let remaining = ids.len() % n;
-		if remaining > 0 && drop_last {
-			ids.truncate(ids.len() - remaining);
-		} else if remaining > 0 {
-			ids.extend((0..(n - remaining)).map(|_| -1)); // Use -1 to indicate padding
-		}
-
-		// Now shape into a 2D array of shape (_, micro_batch_size).
-		let num_micro_batches = ids.len() / micro_batch_size;
-		let mut ids = Array::from_shape_vec((num_micro_batches, micro_batch_size), ids).expect("Failed to create micro-batch array from IDs");
-
-		// Shuffle the micro-batches if requested.
-		if shuffle {
-			let indices = sample(&mut rng, ids.shape()[0], ids.shape()[0]);
-			ids = ids.select(Axis(0), &indices.into_vec());
-		}
-
-		// Shape into 3D array of shape (num_devices, _, micro_batch_size)
-		let num_micro_batches = ids.shape()[0] / world_size;
-		let ids = ids
-			.to_shape((world_size, num_micro_batches, micro_batch_size))
-			.expect("Failed to reshape IDs into 3D array");
-
-		// Select the micro-batches for this device (global_rank).
-		let ids = ids.slice(s![global_rank, .., ..]);
-
-		// Flatten and return as a Vec
-		ids.flatten().to_vec()
-	}
 }
 
 #[pymethods]
@@ -518,7 +305,7 @@ impl StreamingDataset {
 
 		// connection to the cache server
 		let conn = std::sync::Mutex::new(
-			SocketConnection::new(config.get_socket_addr(), config.local_rank as u8, config.global_rank as u8)
+			SocketConnection::new(config.get_socket_addr(), config.global_rank as u16, 0, Some(py))
 				.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?,
 		);
 
@@ -537,7 +324,7 @@ impl StreamingDataset {
 	}
 
 	/// Read a sample based on its global sample index.
-	fn get_sample<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyDict>> {
+	fn get_sample<'py>(&self, py: Python<'py>, index: usize, worker_id: u16) -> PyResult<Bound<'py, PyDict>> {
 		if index >= self.total_samples() as usize {
 			return Err(PyValueError::new_err(format!(
 				"Sample index {} out of bounds for dataset with {} samples",
@@ -555,7 +342,7 @@ impl StreamingDataset {
 			.xxh3_128
 			.ok_or_else(|| PyValueError::new_err("Shard does not have xxh3_128 hash"))?;
 
-		println!(
+		info!(
 			"[{}] Getting sample {} from shard {} ({} samples), offset {}, hash: {:032x}",
 			self.config.local_rank, index, shard_index, shard.samples, offset, shard_hash
 		);
@@ -564,7 +351,7 @@ impl StreamingDataset {
 		self.conn
 			.lock()
 			.map_err(|e| PyIOError::new_err(format!("Failed to lock cache connection: {:?}", e)))?
-			.send_message(shard.remote.as_str(), &shard.local, Some(shard_hash), Some(py))
+			.send_message(shard.remote.as_str(), &shard.local, Some(shard_hash), Some(py), worker_id)
 			.map_err(|e| PyIOError::new_err(format!("Failed to send message to cache server: {:?}", e)))?;
 
 		// once the above request returns, the shard should be available on the filesystem
@@ -580,8 +367,19 @@ impl StreamingDataset {
 		self.total_samples() as usize
 	}
 
-	fn get_indices<'py>(&self, py: Python<'py>, epoch: u64) -> PyResult<Bound<'py, PyArray1<i64>>> {
-		let indices = self.get_my_work(&self.seed, epoch, self.shuffle, self.drop_last, self.micro_batch_size);
+	fn get_indices<'py>(&self, py: Python<'py>, epoch: u64, worker_id: u16, num_workers: u16) -> PyResult<Bound<'py, PyArray1<i64>>> {
+		let indices = get_work(
+			&self.stream_ranges,
+			self.config.global_rank,
+			self.config.world_size,
+			worker_id,
+			num_workers,
+			&self.seed,
+			epoch,
+			self.shuffle,
+			self.drop_last,
+			self.micro_batch_size,
+		);
 		Ok(indices.into_pyarray(py))
 	}
 
@@ -619,7 +417,7 @@ impl StreamingDataset {
 
 	/// Called to unpickle the object.
 	#[staticmethod]
-	fn __setstate__(state: Bound<'_, PyDict>) -> PyResult<StreamingDataset> {
+	fn __setstate__<'py>(state: Bound<'_, PyDict>, py: Python<'py>) -> PyResult<StreamingDataset> {
 		#[derive(Deserialize)]
 		struct StreamingDatasetState {
 			shards: Vec<MDSShardReader>,
@@ -636,12 +434,8 @@ impl StreamingDataset {
 			depythonize(&state).map_err(|e| PyValueError::new_err(format!("Failed to depythonize StreamingDataset state: {:?}", e)))?;
 
 		let conn = Mutex::new(
-			SocketConnection::new(
-				snapshot.config.get_socket_addr(),
-				snapshot.config.local_rank as u8,
-				snapshot.config.global_rank as u8,
-			)
-			.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?,
+			SocketConnection::new(snapshot.config.get_socket_addr(), snapshot.config.global_rank as u16, 0, Some(py))
+				.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?,
 		);
 
 		Ok(StreamingDataset {
@@ -665,23 +459,6 @@ impl Display for StreamingDataset {
 	}
 }
 
-
-/*/// We use abstract namespace to avoid leaving behind sockets in case of a crash or unexpected exit.
-/// Abstract namespace sockets get automatically cleaned up by the kernel when the process exits.
-fn get_socket_path() -> StdSocketAddr {
-	let sock_name = &get_global_config().socket_name;
-	StdSocketAddr::from_abstract_name(sock_name.as_bytes()).expect(format!("Failed to create abstract socket address: {}", sock_name).as_str())
-}*/
-
-
-/*fn get_local_rank() -> u32 {
-	get_global_config().local_rank
-}*/
-
-/// Which node is this (between 0 and number of nodes - 1, inclusive).
-/*fn get_node_rank() -> u32 {
-	get_global_config().node_rank
-}*/
 
 #[derive(Deserialize, Debug)]
 struct IndexJson {
@@ -862,14 +639,13 @@ impl Stream {
 
 fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, py: Python<'py>) -> anyhow::Result<()> {
 	let socket_addr = config.get_socket_addr();
-	let local_rank = config.local_rank as u8; // NOTE: This will wrap if the number of ranks exceeds 255, we'll want to fix that later
-	let global_rank = config.global_rank as u8; // NOTE: This will wrap if the number of ranks exceeds 255, we'll want to fix that later
+	let global_rank = config.global_rank as u16;
 
 	let mut remotes_and_locals = remotes_and_locals
 		.iter()
 		.map(|(remote, local)| {
 			let remote_index = remote.join("index.json").context("Failed to construct index.json URL")?;
-			let local_index = config.cache_dir.join(local).join("index.json");
+			let local_index = Path::new(local).join("index.json");
 			let local_index = local_index
 				.to_str()
 				.ok_or_else(|| anyhow::anyhow!("Local index path is not valid UTF-8: {}", local_index.display()))?
@@ -895,11 +671,11 @@ fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, 
 		let socket_addr = socket_addr.clone();
 
 		threads.push(thread::spawn(move || {
-			let mut conn = SocketConnection::new(socket_addr, local_rank, global_rank).context("Failed to create socket connection")?;
+			let mut conn = SocketConnection::new(socket_addr, global_rank, 0, None).context("Failed to create socket connection")?;
 
 			while let Some((remote_index, local_index)) = remotes_and_locals.lock().unwrap().pop() {
-				if let Err(err) = conn.send_message(remote_index.as_str(), local_index.as_str(), None, None) {
-					eprintln!("Failed to send message to cache server: {:?}", err);
+				if let Err(err) = conn.send_message(remote_index.as_str(), local_index.as_str(), None, None, 0) {
+					error!("Failed to send message to cache server: {:?}", err);
 				}
 			}
 
@@ -911,14 +687,18 @@ fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, 
 	// Calls check_signals to ensure we handle any signals that might have been sent to the process.
 	while !threads.is_empty() {
 		py.check_signals()?;
-		thread::sleep(std::time::Duration::from_millis(100));
+		py.allow_threads(|| {
+			thread::sleep(std::time::Duration::from_millis(100));
 
-		for i in (0..threads.len()).rev() {
-			if threads[i].is_finished() {
-				let thread = threads.remove(i);
-				thread.join().map_err(|e| anyhow::anyhow!("Thread panicked: {:?}", e))??;
+			for i in (0..threads.len()).rev() {
+				if threads[i].is_finished() {
+					let thread = threads.remove(i);
+					thread.join().map_err(|e| anyhow::anyhow!("Thread panicked: {:?}", e))??;
+				}
 			}
-		}
+
+			Ok::<(), anyhow::Error>(())
+		})?;
 	}
 
 	Ok(())
@@ -944,7 +724,6 @@ fn build_streams<'py>(remotes_and_locals: Vec<(String, String)>, config: &Config
 			let remote = if remote.ends_with('/') { remote } else { format!("{}/", remote) };
 
 			let remote = Url::parse(&remote).map_err(|e| PyValueError::new_err(format!("Invalid remote URL: {}", e)))?;
-			println!("Remote mapped to URL: {}", remote);
 			Ok((remote, local))
 		})
 		.collect::<anyhow::Result<Vec<_>>>()?;
@@ -958,6 +737,107 @@ fn build_streams<'py>(remotes_and_locals: Vec<(String, String)>, config: &Config
 		.into_iter()
 		.map(|(remote, local)| Stream::new(remote, local.clone(), &config.cache_dir).with_context(|| format!("Failed to create Stream for {}", local)))
 		.collect::<anyhow::Result<Vec<_>>>()
+}
+
+
+/// Based on the parameters, returns a list of global sample indices that this device should process in the specified epoch.
+#[allow(clippy::too_many_arguments)]
+fn get_work(
+	stream_ranges: &[(u64, u64)],
+	global_rank: u32,
+	world_size: u32,
+	worker_id: u16,
+	num_workers: u16,
+	seed: &[u8],
+	epoch: u64,
+	shuffle: bool,
+	drop_last: bool,
+	micro_batch_size: usize,
+) -> Vec<i64> {
+	info!(
+		"[{}-{}] Getting work for epoch {} with seed {:?}, shuffle: {}, drop_last: {}, micro_batch_size: {}",
+		global_rank, worker_id, epoch, seed, shuffle, drop_last, micro_batch_size,
+	);
+	let global_rank = global_rank as usize;
+	let world_size = world_size as usize;
+	let total_samples = stream_ranges.last().expect("Stream ranges should not be empty").1 as usize;
+
+	// Deterministic shuffling based on the seed and epoch (only used if shuffle is true).
+	let seed1 = xxh3_128(seed);
+	let seed2 = xxh3_128(&epoch.to_le_bytes());
+	let mut seed = [0u8; 32];
+	seed[..16].copy_from_slice(&seed1.to_le_bytes());
+	seed[16..].copy_from_slice(&seed2.to_le_bytes());
+	let mut rng = ChaCha8Rng::from_seed(seed);
+
+	// We start by going through each stream, because batches cannot contain samples from different streams.
+	let mut ids = Vec::with_capacity(total_samples);
+
+	for (sample_begin, sample_end) in stream_ranges {
+		// get a list of all sample IDs in this stream, shuffled if requested.
+		let stream_samples = sample_end - sample_begin;
+		let mut stream_ids = if shuffle {
+			sample(&mut rng, stream_samples as usize, stream_samples as usize)
+				.into_iter()
+				.map(|i| i as i64 + *sample_begin as i64)
+				.collect::<Vec<_>>()
+		} else {
+			((*sample_begin as i64)..(*sample_end as i64)).collect::<Vec<_>>()
+		};
+
+		// Pad or truncate to a multiple of the micro batch size
+		let remainder = stream_ids.len() % micro_batch_size;
+		if remainder > 0 && drop_last {
+			stream_ids.truncate(stream_ids.len() - remainder);
+		} else if remainder > 0 {
+			let padding = micro_batch_size - remainder;
+			stream_ids.extend((0..padding).map(|_| -1)); // Use -1 to indicate padding
+		}
+
+		// Add the stream IDs to the main list.
+		ids.extend(stream_ids.into_iter());
+	}
+
+	// At this point ids is already a multiple of micro_batch_size, but we'll also want it to divide evenly by the number of devices.
+	let n = micro_batch_size * world_size;
+	let remaining = ids.len() % n;
+	if remaining > 0 && drop_last {
+		ids.truncate(ids.len() - remaining);
+	} else if remaining > 0 {
+		ids.extend((0..(n - remaining)).map(|_| -1)); // Use -1 to indicate padding
+	}
+
+	// Now shape into a 2D array of shape (_, micro_batch_size).
+	let mut chunks: Vec<_> = ids.chunks_exact(micro_batch_size).collect();
+	//let num_micro_batches = ids.len() / micro_batch_size;
+	//let mut ids = Array::from_shape_vec((num_micro_batches, micro_batch_size), ids).expect("Failed to create micro-batch array from IDs");
+
+	// Shuffle the micro-batches if requested.
+	if shuffle {
+		chunks.shuffle(&mut rng);
+		//let indices = sample(&mut rng, ids.shape()[0], ids.shape()[0]);
+		//ids = ids.select(Axis(0), &indices.into_vec());
+	}
+
+	// Select the micro-batches for this device (global_rank), round robin so that, for example:
+	// - Device 0 gets micro-batches 0, 2, 4, ...
+	// - Device 1 gets micro-batches 1, 3, 5, ...
+	let ids = chunks
+		.into_iter()
+		.enumerate()
+		.filter_map(|(i, batch)| if i % world_size == global_rank { Some(batch) } else { None });
+
+	// Select the micro-batches for this worker, also round-robin.
+	let ids = ids
+		.enumerate()
+		.filter_map(|(i, batch)| if i % num_workers as usize == worker_id as usize { Some(batch) } else { None })
+		.flatten()
+		.cloned()
+		.collect::<Vec<_>>();
+
+	info!("[{}-{}] Work for epoch {}: {:?}", global_rank, worker_id, epoch, ids);
+
+	ids
 }
 
 
@@ -1072,21 +952,41 @@ where
 }
 
 
-/*async fn wait_for_file(path: &Path, timeout: std::time::Duration) -> anyhow::Result<()> {
-	let start = std::time::Instant::now();
-	while !path.exists() {
-		if start.elapsed() > timeout {
-			bail!("Timeout waiting for file: {}", path.display());
-		}
-		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+trait OptionPythonExt {
+	fn check_signals(&self) -> PyResult<()>;
+	fn allow_threads<T, F>(&self, f: F) -> T
+	where
+		F: Ungil + FnOnce() -> T,
+		T: Ungil;
+}
+
+impl OptionPythonExt for Option<Python<'_>> {
+	fn check_signals(&self) -> PyResult<()> {
+		if let Some(py) = self { py.check_signals() } else { Ok(()) }
 	}
-	Ok(())
-}*/
+
+	fn allow_threads<T, F>(&self, f: F) -> T
+	where
+		F: Ungil + FnOnce() -> T,
+		T: Ungil,
+	{
+		if let Some(py) = self { py.allow_threads(f) } else { f() }
+	}
+}
+
+
+/// Does a std::thread::sleep, but allows the Python GIL to be released during the sleep (if `py` is Some).
+fn std_sleep_allow_threads<'py>(duration: std::time::Duration, py: Option<Python<'py>>) {
+	if let Some(py) = py {
+		py.allow_threads(|| thread::sleep(duration));
+	} else {
+		thread::sleep(duration);
+	}
+}
 
 
 #[cfg(test)]
 mod tests {
-
 	use super::ColumnEncoding;
 	use pyo3::prelude::*;
 	use std::io::Cursor;

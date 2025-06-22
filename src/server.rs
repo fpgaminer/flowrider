@@ -1,9 +1,11 @@
 use anyhow::{Context, bail, ensure};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use clap::Parser;
-use pyo3::{PyResult, Python, pyfunction};
+use log::{error, info, warn};
+use pyo3::Python;
 use rand::distr::SampleString;
+use s3::Bucket;
 use std::{
+	env,
 	io::Write,
 	os::{
 		linux::net::SocketAddrExt,
@@ -22,58 +24,7 @@ use tokio::{
 };
 use url::Url;
 
-use crate::cache::ShardCache;
-
-
-#[derive(Parser, Debug)]
-#[command(name = "flowrider-server", version, about = "Flowrider cache server")]
-struct ServerArgs {
-	/// The socket name to use
-	#[arg(long, required = true)]
-	socket_name: String,
-
-	/// The maximum size of the cache in bytes.
-	/// If 0, the cache will not limit its size.
-	#[arg(long, default_value_t = 1024 * 1024 * 1024)] // Default to 1 GiB
-	cache_limit: u64,
-
-	/// The maximum number of concurrent downloads.
-	#[arg(long, default_value_t = 8)]
-	max_downloads: usize,
-
-	/// Cache directory to use.
-	#[arg(long, required = true)]
-	cache_dir: String,
-
-	/// Number of worker threads to use for the Tokio runtime.
-	#[arg(long, default_value_t = 8)]
-	worker_threads: usize,
-}
-
-
-#[pyfunction]
-pub fn server_entrypoint() -> PyResult<()> {
-	// This function is called when `flowrider-server` is run from the command line.
-	// It starts the cache server and blocks until it is stopped.
-
-	println!("DEBUG: Arguments: {:?}", std::env::args_os().collect::<Vec<_>>());
-
-	// if the first argument is a python interpreter, skip it
-	let args = if Path::new(&std::env::args_os().next().unwrap_or_default())
-		.file_stem()
-		.and_then(|s| s.to_str())
-		.map(|stem| stem.starts_with("python"))
-		.unwrap_or(false)
-	{
-		ServerArgs::parse_from(std::env::args_os().skip(1))
-	} else {
-		ServerArgs::parse()
-	};
-
-	start_server(&args.socket_name, args.cache_limit, args.max_downloads, args.cache_dir, args.worker_threads);
-
-	Ok(())
-}
+use crate::{OptionPythonExt, cache::ShardCache, std_sleep_allow_threads};
 
 
 pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, cache_dir: String, worker_threads: usize) {
@@ -86,10 +37,10 @@ pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, c
 		.build()
 		.expect("Failed to build Tokio runtime");
 
-	println!("Starting Flowrider cache server...");
+	info!("Starting Flowrider cache server...");
 	rt.block_on(async {
 		if let Err(e) = server(socket_addr, cache_limit, max_downloads, cache_dir).await {
-			eprintln!("Error in server: {}", e);
+			error!("Error in server: {}", e);
 		}
 	});
 }
@@ -106,7 +57,13 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 	// Acquire a permit from the semaphore to limit concurrent downloads
 	let _download_permit = semaphore.acquire().await.expect("Failed to acquire semaphore for download");
 
-	println!("Downloading file from {} to {}", url, dest_path.display());
+	// If the file already exists, we can skip downloading it
+	if tokio::fs::try_exists(dest_path).await.unwrap_or(false) {
+		// If the file already exists, we can skip downloading it
+		return Ok(());
+	}
+
+	info!("Downloading file from {} to {}", url, dest_path.display());
 
 	// create destination directory if it doesn't exist
 	fs::create_dir_all(dest_parent)
@@ -149,6 +106,42 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 					tmp_path.display()
 				))?;
 			},
+			"s3" => {
+				// Get the S3 endpoint URL and credentials
+				let endpoint_url = env::var("S3_ENDPOINT_URL").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
+				let credentials = s3::creds::Credentials::default().context("Failed to get S3 credentials")?;
+
+				info!(
+					"Downloading S3 object, endpoint: {}, bucket: {}, key: {}",
+					endpoint_url,
+					url.host_str().unwrap_or(""),
+					url.path()
+				);
+
+				// Create the S3 bucket client
+				let bucket_name = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URL: {}", url))?;
+				let bucket = Bucket::new(
+					bucket_name,
+					s3::Region::Custom {
+						region: "us-east-1".to_string(),
+						endpoint: endpoint_url,
+					},
+					credentials,
+				)
+				.context("Failed to establish S3 connection")?
+				.with_path_style();
+
+				// Download the object from S3
+				let response_data = bucket.get_object(url.path()).await.context(format!("Failed to download S3 object: {}", url))?;
+				if response_data.status_code() != 200 {
+					bail!("Failed to download S3 object: {}. Status code: {}", url, response_data.status_code());
+				}
+
+				// Write the object data to the temporary file
+				fs::write(&tmp_path, response_data.as_slice())
+					.await
+					.context(format!("Failed to write S3 object to temporary file: {}", tmp_path.display()))?;
+			},
 			_ => bail!("Unsupported URL scheme: {}", url.scheme()),
 		}
 
@@ -168,8 +161,8 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 
 			let hash = hasher.digest128();
 			if hash != expected_hash {
-				eprintln!(
-					"Warning: Hash mismatch for downloaded file {}. Expected: {:032x}, got: {:032x}. Will retry download.",
+				warn!(
+					"Hash mismatch for downloaded file {}. Expected: {:032x}, got: {:032x}. Will retry download.",
 					tmp_path.display(),
 					expected_hash,
 					hash
@@ -197,7 +190,7 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 	let std_listener = StdUnixListener::bind_addr(&addr)?;
 	std_listener.set_nonblocking(true)?;
 	let listener = UnixListener::from_std(std_listener)?;
-	println!("Flowrider Server listening on {:?}", addr);
+	info!("Flowrider Server listening on {:?}", addr);
 
 	loop {
 		let (mut stream, _) = listener.accept().await?;
@@ -208,22 +201,21 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 			let client_ranks = match stream.read_u32_le().await {
 				Ok(rank) => rank,
 				Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-					eprintln!("Client disconnected before sending rank");
+					warn!("Client disconnected before sending rank");
 					return;
 				},
 				Err(e) => {
-					eprintln!("Failed to read client rank: {}", e);
+					error!("Failed to read client rank: {:?}", e);
 					return;
 				},
 			};
-			let client_node = client_ranks >> 24;
-			let client_rank = (client_ranks >> 16) & 0xFF;
+			let client_rank = client_ranks >> 16;
 			let client_worker_id = client_rank & 0xFFFF;
 
 			if let Err(e) = handle_connection(stream, cache, download_semaphore).await {
-				eprintln!(
-					"an error occurred while handling connection from node={},rank={},worker={}: {:?}",
-					client_node, client_rank, client_worker_id, e
+				error!(
+					"an error occurred while handling connection from rank={},worker={}: {:?}",
+					client_rank, client_worker_id, e
 				);
 			}
 		});
@@ -258,9 +250,8 @@ async fn handle_connection(mut stream: UnixStream, cache: ShardCache, download_s
 		let remote = read_string(&mut cursor).context("Failed to read remote URI")?;
 		let local = read_string(&mut cursor).context("Failed to read local path")?;
 		let expected_hash = ReadBytesExt::read_u128::<byteorder::LittleEndian>(&mut cursor).context("Failed to read expected hash")?;
-		println!("Received request for {} -> {} ({:032x})", remote, local, expected_hash);
+		info!("Received request for {} -> {} ({:032x})", remote, local, expected_hash);
 		let expected_hash = if expected_hash == 0 { None } else { Some(expected_hash) };
-
 
 		// parse remote URI
 		let remote_uri = Url::parse(&remote).context(format!("Failed to parse remote URI: {}", remote))?;
@@ -297,25 +288,26 @@ pub struct SocketConnection {
 	addr: StdSocketAddr, // The address of the server we are connected to.
 	in_progress: bool,
 	pid: u32, // Process ID of the process that created this connection. Used to detect forks.
-	local_rank: u8,
-	global_rank: u8,
+	global_rank: u16,
 }
 
-fn connect_to_server(addr: &StdSocketAddr, local_rank: u8, global_rank: u8) -> anyhow::Result<StdUnixStream> {
+fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16, py: Option<Python<'py>>) -> anyhow::Result<StdUnixStream> {
 	// TODO: Worker process ID?
-	let ranks = (global_rank as u32) << 24 | (local_rank as u32) << 16;
+	let ranks = (global_rank as u32) << 16 | (worker_id as u32);
 
 	loop {
-		match StdUnixStream::connect_addr(addr) {
+		py.check_signals()?;
+
+		match py.allow_threads(|| StdUnixStream::connect_addr(addr)) {
 			Ok(mut stream) => {
 				stream
 					.set_read_timeout(Some(std::time::Duration::from_secs(1)))
 					.map_err(|e| anyhow::anyhow!("Failed to set read timeout: {}", e))?;
 
 				// introduce ourselves to the server
-				if let Err(e) = stream.write_u32::<byteorder::LittleEndian>(ranks) {
-					eprintln!("Failed to send ranks to server (will retry): {}", e);
-					std::thread::sleep(std::time::Duration::from_millis(1000));
+				if let Err(e) = py.allow_threads(|| stream.write_u32::<byteorder::LittleEndian>(ranks)) {
+					warn!("Failed to send ranks to server (will retry): {:?}", e);
+					std_sleep_allow_threads(std::time::Duration::from_millis(1000), py);
 					continue;
 				}
 
@@ -323,26 +315,25 @@ fn connect_to_server(addr: &StdSocketAddr, local_rank: u8, global_rank: u8) -> a
 			},
 			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
 				// If the socket doesn't exist, wait and retry
-				std::thread::sleep(std::time::Duration::from_millis(100));
+				std_sleep_allow_threads(std::time::Duration::from_millis(100), py);
 			},
 			Err(e) => {
-				eprintln!("Failed to connect to socket at {:?} (will retry): {}", addr, e);
-				std::thread::sleep(std::time::Duration::from_millis(1000));
+				warn!("Failed to connect to socket at {:?} (will retry): {:?}", addr, e);
+				std_sleep_allow_threads(std::time::Duration::from_millis(1000), py);
 			},
 		}
 	}
 }
 
 impl SocketConnection {
-	pub fn new(addr: StdSocketAddr, local_rank: u8, global_rank: u8) -> anyhow::Result<Self> {
-		let stream = connect_to_server(&addr, local_rank, global_rank).context("Failed to connect to server")?;
+	pub fn new<'py>(addr: StdSocketAddr, global_rank: u16, worker_id: u16, py: Option<Python<'py>>) -> anyhow::Result<Self> {
+		let stream = connect_to_server(&addr, global_rank, worker_id, py).context("Failed to connect to server")?;
 
 		Ok(SocketConnection {
 			stream,
 			addr,
 			in_progress: false,
 			pid: std::process::id(),
-			local_rank,
 			global_rank,
 		})
 	}
@@ -352,12 +343,19 @@ impl SocketConnection {
 	/// `remote_uri` must fit in a u16, so it must be less than 65536 bytes.
 	/// `local_path` must also fit in a u16, so it must be less than 65536 bytes.
 	/// The server is always expected to respond with 1.
-	pub fn send_message<'py>(&mut self, remote_uri: &str, local_path: &str, expected_hash: Option<u128>, py: Option<Python<'py>>) -> anyhow::Result<u8> {
+	pub fn send_message<'py>(
+		&mut self,
+		remote_uri: &str,
+		local_path: &str,
+		expected_hash: Option<u128>,
+		py: Option<Python<'py>>,
+		worker_id: u16,
+	) -> anyhow::Result<u8> {
 		if self.pid != std::process::id() {
 			// If the PID has changed, we need to re-establish the connection.
-			self.stream = connect_to_server(&self.addr, self.local_rank, self.global_rank).context("Failed to reconnect to server")?;
+			self.stream = connect_to_server(&self.addr, self.global_rank, worker_id, py).context("Failed to reconnect to server")?;
 			self.in_progress = false;
-			println!("Reconnected to server after fork, PID changed from {} to {}", self.pid, std::process::id());
+			info!("Reconnected to server after fork, PID changed from {} to {}", self.pid, std::process::id());
 			self.pid = std::process::id();
 		}
 
@@ -394,11 +392,9 @@ impl SocketConnection {
 		// Wait for a response (1 byte)
 		// We use a loop with a short read timeout so we can repeatedly call `check_signals` in the loop to handle ctrl+c, etc.
 		let response = loop {
-			if let Some(py) = py {
-				py.check_signals()?;
-			}
+			py.check_signals()?;
 
-			match self.stream.read_u8() {
+			match py.allow_threads(|| self.stream.read_u8()) {
 				Ok(response) => {
 					break response;
 				},

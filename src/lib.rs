@@ -740,7 +740,29 @@ fn build_streams<'py>(remotes_and_locals: Vec<(String, String)>, config: &Config
 }
 
 
-/// Based on the parameters, returns a list of global sample indices that this device should process in the specified epoch.
+/// Based on the parameters, returns a list of global sample indices that this worker should process.
+/// Micro-batches are always homogeneous with respect to streams, meaning that a micro-batch will only contain samples from a single stream.
+/// 
+/// Work is split first across ranks, round-robin style.  That means, for example:
+/// Rank 0 micro-batches: 0, 4, 8
+/// Rank 1 micro-batches: 1, 5, 9
+/// Rank 2 micro-batches: 2, 6, 10
+/// Rank 3 micro-batches: 3, 7, 11
+/// That way, the full, distributed batches are correctly sequential: (0, 1, 2, 3), (4, 5, 6, 7), (8, 9, 10, 11), ...
+/// Then, within each rank, the work is split across workers, also round-robin style, for similar reasons and guarantees.
+/// 
+/// This function is stable even when changing the total number of ranks.  The sequence of samples/micro-batches
+/// is the same regardless of the number of ranks, meaning training runs will progress deterministically.
+/// This also means runs can be resumed on setups with a different number of ranks than the original run.
+/// 
+/// When shuffling is enabled, the seed and epoch are used to create a deterministic shuffle of the samples.
+/// 
+/// When drop_last is disabled, two things will happen.  First, some samples from each stream might be dropped if any stream
+/// isn't divisble by the micro batch size.  Second, some micro batches will be dropped if the number of micro batches is
+/// not divisible by the number of global ranks.
+/// If drop_last is enabled, instead of dropping samples, the last micro batch in each stream will be padded with -1 to
+/// fill it up.  And micro batches of all -1s will be added to pad out across ranks.
+/// (No padding is performed to divide by the number of workers, so some workers might end up idle in some cases)
 #[allow(clippy::too_many_arguments)]
 fn get_work(
 	stream_ranges: &[(u64, u64)],
@@ -987,7 +1009,7 @@ fn std_sleep_allow_threads<'py>(duration: std::time::Duration, py: Option<Python
 
 #[cfg(test)]
 mod tests {
-	use super::ColumnEncoding;
+	use super::{ColumnEncoding, get_work};
 	use pyo3::prelude::*;
 	use std::io::Cursor;
 
@@ -1063,5 +1085,538 @@ mod tests {
 			let res = ColumnEncoding::Int32.decode_to_python(py, Cursor::new(buf), 4, &frombuffer);
 			assert!(res.is_err());
 		});
+	}
+
+	// Tests for get_work function
+	#[test]
+	fn get_work_basic_functionality() {
+		// Simple test with one stream, no shuffling, no padding needed
+		let stream_ranges = vec![(0, 8)]; // 8 samples in one stream
+		let work = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last
+			2, // micro_batch_size
+		);
+		
+		// Should get all samples: [0, 1, 2, 3, 4, 5, 6, 7]
+		assert_eq!(work, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+	}
+
+	#[test]
+	fn get_work_multiple_streams_no_shuffle() {
+		// Two streams with different sizes
+		let stream_ranges = vec![(0, 4), (4, 8)]; // Stream 1: [0,1,2,3], Stream 2: [4,5,6,7]
+		let work = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last
+			2, // micro_batch_size
+		);
+		
+		// Should get all samples in order: [0, 1, 2, 3, 4, 5, 6, 7]
+		assert_eq!(work, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+	}
+
+	#[test]
+	fn get_work_padding_with_drop_last_false() {
+		// Test padding when stream size is not divisible by micro_batch_size
+		let stream_ranges = vec![(0, 5)]; // 5 samples, micro_batch_size = 2
+		let work = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last (padding enabled)
+			2, // micro_batch_size
+		);
+		
+		// Should pad: [0, 1, 2, 3, 4, -1]
+		assert_eq!(work, vec![0, 1, 2, 3, 4, -1]);
+	}
+
+	#[test]
+	fn get_work_truncation_with_drop_last_true() {
+		// Test truncation when drop_last is true
+		let stream_ranges = vec![(0, 5)]; // 5 samples, micro_batch_size = 2
+		let work = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			true, // drop_last (truncation enabled)
+			2, // micro_batch_size
+		);
+		
+		// Should truncate: [0, 1, 2, 3] (last sample dropped)
+		assert_eq!(work, vec![0, 1, 2, 3]);
+	}
+
+	#[test]
+	fn get_work_round_robin_across_ranks() {
+		// Test round-robin distribution across multiple ranks
+		let stream_ranges = vec![(0, 8)]; // 8 samples
+		let micro_batch_size = 2;
+		let world_size = 2;
+		
+		// Get work for rank 0
+		let work_rank0 = get_work(
+			&stream_ranges,
+			0, // global_rank
+			world_size,
+			0, // worker_id
+			1, // num_workers
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last
+			micro_batch_size,
+		);
+		
+		// Get work for rank 1
+		let work_rank1 = get_work(
+			&stream_ranges,
+			1, // global_rank
+			world_size,
+			0, // worker_id
+			1, // num_workers
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last
+			micro_batch_size,
+		);
+		
+		// Rank 0 should get micro-batches 0, 2 -> [0, 1, 4, 5]
+		// Rank 1 should get micro-batches 1, 3 -> [2, 3, 6, 7]
+		assert_eq!(work_rank0, vec![0, 1, 4, 5]);
+		assert_eq!(work_rank1, vec![2, 3, 6, 7]);
+	}
+
+	#[test]
+	fn get_work_round_robin_across_workers() {
+		// Test round-robin distribution across multiple workers within a rank
+		let stream_ranges = vec![(0, 8)]; // 8 samples
+		let micro_batch_size = 2;
+		let num_workers = 2;
+		
+		// Get work for worker 0
+		let work_worker0 = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			num_workers,
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last
+			micro_batch_size,
+		);
+		
+		// Get work for worker 1
+		let work_worker1 = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			1, // worker_id
+			num_workers,
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last
+			micro_batch_size,
+		);
+		
+		// Worker 0 should get micro-batches 0, 2 -> [0, 1, 4, 5]
+		// Worker 1 should get micro-batches 1, 3 -> [2, 3, 6, 7]
+		assert_eq!(work_worker0, vec![0, 1, 4, 5]);
+		assert_eq!(work_worker1, vec![2, 3, 6, 7]);
+	}
+
+	#[test]
+	fn get_work_deterministic_shuffling() {
+		// Test that shuffling is deterministic with same seed and epoch
+		let stream_ranges = vec![(0, 8)]; // 8 samples
+		let seed = b"test_seed";
+		let epoch = 5;
+		
+		let work1 = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			seed,
+			epoch,
+			true, // shuffle
+			false, // drop_last
+			2, // micro_batch_size
+		);
+		
+		let work2 = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			seed,
+			epoch,
+			true, // shuffle
+			false, // drop_last
+			2, // micro_batch_size
+		);
+		
+		// Should be identical
+		assert_eq!(work1, work2);
+		
+		// But should be different from non-shuffled
+		let work_no_shuffle = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			seed,
+			epoch,
+			false, // shuffle
+			false, // drop_last
+			2, // micro_batch_size
+		);
+		
+		assert_ne!(work1, work_no_shuffle);
+	}
+
+	#[test]
+	fn get_work_different_epochs_different_shuffle() {
+		// Test that different epochs produce different shuffles
+		let stream_ranges = vec![(0, 8)]; // 8 samples
+		let seed = b"test_seed";
+		
+		let work_epoch0 = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			seed,
+			0, // epoch
+			true, // shuffle
+			false, // drop_last
+			2, // micro_batch_size
+		);
+		
+		let work_epoch1 = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			seed,
+			1, // epoch
+			true, // shuffle
+			false, // drop_last
+			2, // micro_batch_size
+		);
+		
+		// Should be different (very high probability)
+		assert_ne!(work_epoch0, work_epoch1);
+	}
+
+	#[test]
+	fn get_work_stream_homogeneity() {
+		// Test that micro-batches are homogeneous with respect to streams
+		let stream_ranges = vec![(0, 4), (4, 8)]; // Two streams: [0,1,2,3] and [4,5,6,7]
+		let micro_batch_size = 2;
+		
+		let work = get_work(
+			&stream_ranges,
+			0, // global_rank
+			1, // world_size
+			0, // worker_id
+			1, // num_workers
+			b"test_seed",
+			0, // epoch
+			false, // shuffle
+			false, // drop_last
+			micro_batch_size,
+		);
+		
+		// Check that each micro-batch contains samples from only one stream
+		let micro_batches: Vec<_> = work.chunks(micro_batch_size).collect();
+		
+		for batch in micro_batches {
+			// All samples in a micro-batch should be from the same stream
+			let first_sample = batch[0];
+			if first_sample == -1 {
+				// Skip padding samples
+				continue;
+			}
+			
+			let stream_id = if first_sample < 4 { 0 } else { 1 };
+			
+			for &sample in batch {
+				if sample == -1 {
+					continue; // Skip padding
+				}
+				let sample_stream = if sample < 4 { 0 } else { 1 };
+				assert_eq!(stream_id, sample_stream, 
+					"Micro-batch contains samples from different streams: {:?}", batch);
+			}
+		}
+	}
+
+	#[test]
+	fn get_work_rank_stability_guarantee() {
+		// The rank stability guarantee means that the sequence of samples/micro-batches
+		// should be the same regardless of world size or number of workers.
+		let stream_ranges = vec![(0, 128)];
+		let micro_batch_size = 2;
+		let batch_size = 8;
+		let seed = b"stability_test";
+		let epoch = 0;
+		let total_samples = stream_ranges[0].1 as usize;
+
+		// Try both shuffling enabled and disabled
+		for shuffle in [false, true] {
+			let mut results = Vec::new();
+
+			// Try different world sizes and worker counts
+			for (num_workers, world_size) in (1..=4).flat_map(|w| (1..=8).map(move |r| (w, r))) {
+				// Only consider cases where the samples are cleanly divisible
+				if total_samples % (micro_batch_size * world_size) != 0 {
+					continue;
+				}
+
+				println!("Testing world_size={} num_workers={} shuffle={}", world_size, num_workers, shuffle);
+
+				// Gather work
+				let mut ranks = Vec::new();
+				for rank in 0..world_size {
+					let mut workers = Vec::new();
+					for worker_id in 0..num_workers {
+						workers.push(get_work(&stream_ranges, rank as u32, world_size as u32, worker_id as u16, num_workers as u16, seed, epoch, shuffle, false, micro_batch_size));
+					}
+					ranks.push(workers);
+				}
+
+				// Simulate a training run
+				// worker_ptrs is the current worker a given rank will pull from
+				// rank_ptr is the current rank that will be pulled from
+				// We iterate over all micro-batches, round-robinning like a real training loop.
+				let mut worker_ptrs = vec![0usize; world_size];
+				let mut rank_ptr = 0usize;
+				let mut micro_batches = Vec::new();
+
+				for _ in 0..(stream_ranges[0].1 as usize / micro_batch_size) {
+					let worker_ptr = worker_ptrs[rank_ptr];
+					let rank = &mut ranks[rank_ptr];
+					let worker = &mut rank[worker_ptr];
+					let mut micro_batch = Vec::new();
+					for _ in 0..micro_batch_size {
+						micro_batch.push(worker.remove(0));
+					}
+
+					micro_batches.push(micro_batch);
+					worker_ptrs[rank_ptr] = (worker_ptr + 1) % num_workers;
+					rank_ptr = (rank_ptr + 1) % world_size;
+				}
+
+				// Build full batches from micro-batches
+				let batches = micro_batches.chunks_exact(batch_size / micro_batch_size).map(|chunk| chunk.to_vec()).collect::<Vec<_>>();
+				results.push(batches);
+			}
+
+			// Verify that all results are equal
+			for i in 1..results.len() {
+				assert_eq!(results[0], results[i], "Results should be equal across different rank and worker configurations: {:?} vs {:?}", results[0], results[i]);
+			}
+		}
+	}
+
+	#[test]
+	fn get_work_cross_rank_worker_distribution() {
+		// Test complex scenario with multiple ranks and workers
+		let stream_ranges = vec![(0, 16)]; // 16 samples
+		let micro_batch_size = 2;
+		let world_size = 2;
+		let num_workers = 2;
+		
+		// Collect work from all rank-worker combinations
+		let mut all_samples = std::collections::HashSet::new();
+		let mut all_work = Vec::new();
+		
+		for rank in 0..world_size {
+			for worker in 0..num_workers {
+				let work = get_work(
+					&stream_ranges,
+					rank,
+					world_size,
+					worker,
+					num_workers,
+					b"test_seed",
+					0, // epoch
+					false, // shuffle
+					false, // drop_last
+					micro_batch_size,
+				);
+				
+				// Collect all non-padding samples
+				for &sample in &work {
+					if sample != -1 {
+						all_samples.insert(sample);
+					}
+				}
+				
+				all_work.push((rank, worker, work));
+			}
+		}
+		
+		// Should cover all samples exactly once (no duplicates, no missing)
+		let expected_samples: std::collections::HashSet<_> = (0..16).collect();
+		assert_eq!(all_samples, expected_samples, 
+			"All samples should be processed exactly once across all rank-worker combinations");
+		
+		// Verify no work overlap between different rank-worker combinations
+		for i in 0..all_work.len() {
+			for j in (i+1)..all_work.len() {
+				let (rank1, worker1, work1) = &all_work[i];
+				let (rank2, worker2, work2) = &all_work[j];
+				
+				let samples1: std::collections::HashSet<_> = work1.iter()
+					.filter(|&&s| s != -1).collect();
+				let samples2: std::collections::HashSet<_> = work2.iter()
+					.filter(|&&s| s != -1).collect();
+				
+				let intersection: Vec<_> = samples1.intersection(&samples2).collect();
+				assert!(intersection.is_empty(), 
+					"Rank {}-Worker {} and Rank {}-Worker {} should not have overlapping samples: {:?}",
+					rank1, worker1, rank2, worker2, intersection);
+			}
+		}
+	}
+
+	#[test]
+	fn get_work_padding_across_ranks() {
+		// Test padding behavior when total micro-batches don't divide evenly across ranks
+		let stream_ranges = vec![(0, 7)]; // 7 samples
+		let micro_batch_size = 2;
+		let world_size = 4; // This will require significant padding
+		
+		let mut all_work = Vec::new();
+		for rank in 0..world_size {
+			let work = get_work(
+				&stream_ranges,
+				rank,
+				world_size,
+				0, // worker_id
+				1, // num_workers
+				b"test_seed",
+				0, // epoch
+				false, // shuffle
+				false, // drop_last (padding enabled)
+				micro_batch_size,
+			);
+			all_work.push(work);
+		}
+		
+		// Each rank should get the same number of samples (due to padding)
+		let work_lengths: Vec<_> = all_work.iter().map(|w| w.len()).collect();
+		assert!(work_lengths.iter().all(|&len| len == work_lengths[0]),
+			"All ranks should get the same amount of work when padding is enabled: {:?}", work_lengths);
+		
+		// Count total non-padding samples
+		let total_real_samples: usize = all_work.iter()
+			.flat_map(|work| work.iter())
+			.filter(|&&s| s != -1)
+			.count();
+		
+		// Should be equal to the original 7 samples (possibly padded within streams)
+		// The stream will be padded to 8 samples (7 + 1 padding), then all samples distributed
+		assert_eq!(total_real_samples, 7, "Should preserve all original samples");
+	}
+
+	#[test]
+	fn get_work_empty_result_with_insufficient_samples() {
+		// Test edge case where there are fewer samples than ranks/workers need
+		let stream_ranges = vec![(0, 2)]; // Only 2 samples
+		let micro_batch_size = 2;
+		let world_size = 4; // 4 ranks, but only 1 micro-batch total
+		
+		// Check what actually happens with drop_last=true
+		let mut ranks_with_work = 0;
+		let mut total_work = Vec::new();
+		
+		for rank in 0..world_size {
+			let work = get_work(
+				&stream_ranges,
+				rank,
+				world_size,
+				0, // worker_id
+				1, // num_workers
+				b"test_seed",
+				0, // epoch
+				false, // shuffle
+				true, // drop_last
+				micro_batch_size,
+			);
+			
+			if !work.is_empty() {
+				ranks_with_work += 1;
+				total_work.extend(work);
+			}
+		}
+		
+		// With drop_last=true and insufficient samples to fill world_size micro-batches,
+		// the algorithm should drop everything, so no ranks get work
+		assert_eq!(ranks_with_work, 0, "No ranks should get work when insufficient samples and drop_last=true");
+		assert!(total_work.is_empty(), "No work should be distributed");
+		
+		// Now test with drop_last=false to see padding behavior
+		let mut ranks_with_work_padded = 0;
+		let mut total_work_padded = Vec::new();
+		
+		for rank in 0..world_size {
+			let work = get_work(
+				&stream_ranges,
+				rank,
+				world_size,
+				0, // worker_id
+				1, // num_workers
+				b"test_seed",
+				0, // epoch
+				false, // shuffle
+				false, // drop_last (padding enabled)
+				micro_batch_size,
+			);
+			
+			if !work.is_empty() {
+				ranks_with_work_padded += 1;
+				total_work_padded.extend(work);
+			}
+		}
+		
+		// With padding, all ranks should get equal work
+		assert_eq!(ranks_with_work_padded, world_size, "All ranks should get work when padding is enabled");
 	}
 }

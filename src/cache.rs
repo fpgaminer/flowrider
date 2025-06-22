@@ -39,6 +39,7 @@ impl ShardCache {
 					if let Err(err) = tokio::fs::remove_file(Path::new(&*key)).await {
 						warn!("Cache failed to remove file {}: {}", key, err);
 					}
+					info!("Cache removed file {}", key);
 				}
 				.boxed()
 			});
@@ -244,6 +245,8 @@ async fn download_shard(remote: &Url, local: &str, expected_hash: Option<u128>, 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::time::Duration;
+	use tokio::time::sleep;
 
 	#[test]
 	fn test_is_local_path_valid() {
@@ -276,5 +279,57 @@ mod tests {
 		assert!(!is_local_path_valid(""), "Empty path is not valid");
 		assert!(!is_local_path_valid("dir/"), "Filename is required for a valid local path");
 		assert!(!is_local_path_valid("subdir/nested/"), "Filename is required for a valid local path");
+	}
+
+	/// Insert two shards whose combined weight is larger than the configured
+	/// `cache_limit` and ensure that the cache evicts enough data to respect
+	/// the limit.  Also confirm that the eviction listener removed at least
+	/// one of the corresponding files from disk.
+	#[tokio::test(flavor = "current_thread")]
+	async fn shard_cache_respects_size_limit() {
+		// ────── Arrange ──────
+		// A tiny cache (1 KiB) and a temporary directory to act as the cache dir.
+		let cache_limit: u64 = 1024;
+		let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
+		let cache_dir = tmpdir.path().to_str().unwrap();
+
+		// Build the cache (this also scans the directory, which is empty now).
+		let shard_cache = ShardCache::new(cache_limit, cache_dir).await;
+
+		// Create two dummy shard files, each 800 bytes – together they exceed the limit.
+		let shard_a_path = tmpdir.path().join("shard_a.mds");
+		let shard_b_path = tmpdir.path().join("shard_b.mds");
+		tokio::fs::write(&shard_a_path, vec![0u8; 800]).await.expect("write shard_a");
+		tokio::fs::write(&shard_b_path, vec![0u8; 800]).await.expect("write shard_b");
+
+		// Helper to wrap a file into an Arc<ShardMeta>.
+		let make_meta = |bytes| Arc::new(ShardMeta { bytes, remote: None });
+
+		// ────── Act ──────
+		// Insert both shards.  After the second insert the cache weight
+		// (800 + 800) exceeds the 1 KiB limit, so Moka must evict.
+		shard_cache.cache.insert(shard_a_path.to_str().unwrap().to_owned(), make_meta(800)).await;
+		shard_cache.cache.insert(shard_b_path.to_str().unwrap().to_owned(), make_meta(800)).await;
+
+		// Let the cache run its eviction tasks.
+		shard_cache.cache.run_pending_tasks().await;
+
+		// Sleep just in case.
+		sleep(Duration::from_millis(100)).await;
+
+		// ────── Assert ──────
+		// 1. The in‑memory weighted size never exceeds the limit.
+		assert!(
+			shard_cache.cache.weighted_size() <= cache_limit && shard_cache.cache.weighted_size() > 0,
+			"cache weighted_size={} exceeds limit={} or is zero",
+			shard_cache.cache.weighted_size(),
+			cache_limit
+		);
+
+		// 2. At least one of the shard files was removed from disk by
+		//    the eviction listener (proving that the listener executed).
+		let exists_a = tokio::fs::try_exists(&shard_a_path).await.unwrap();
+		let exists_b = tokio::fs::try_exists(&shard_b_path).await.unwrap();
+		assert!(!(exists_a && exists_b), "both shard files are still present; eviction listener did not run");
 	}
 }

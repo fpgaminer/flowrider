@@ -10,14 +10,13 @@ use std::{
 	io::{Cursor, Read, Seek, SeekFrom, Write},
 	os::linux::net::SocketAddrExt,
 	path::{Path, PathBuf},
-	sync::{Arc, Mutex},
+	sync::{Arc, Mutex, atomic::AtomicUsize},
 	thread::{self, JoinHandle},
 };
 
 use anyhow::{Context, bail};
 use byteorder::ReadBytesExt;
 use log::{error, info};
-use numpy::{IntoPyArray, PyArray1};
 use pyo3::{
 	exceptions::{PyIOError, PyValueError},
 	marker::Ungil,
@@ -77,6 +76,8 @@ struct Config {
 	cache_dir: PathBuf,
 	/// Maximum number of concurrent downloads allowed.
 	max_downloads: usize,
+	/// How far ahead to to prefetch shards.
+	readahead: usize,
 }
 
 #[pymethods]
@@ -95,12 +96,13 @@ impl Config {
 	/// Note: This function will start the background cache server if it is not already running.  The cache server will only be started once per node.  It runs as a background thread of one of the processes on this local node.
 	/// If the process running the cache server gets forked (which is the default for PyTorch dataloader workers), the fact that the cache server is in a different thread ensures it does not survive to the child processes (which is good, because it has non-fork safe state).
 	#[new]
-	#[pyo3(signature = (cache_dir, cache_limit=0, max_downloads=8, num_cache_workers=None, local_rank=None, global_rank=None, world_size=None, master_addr=None, master_port=None))]
+	#[pyo3(signature = (cache_dir, cache_limit=0, max_downloads=8, readahead=6, num_cache_workers=None, local_rank=None, global_rank=None, world_size=None, master_addr=None, master_port=None))]
 	#[allow(clippy::too_many_arguments)]
 	fn new(
 		cache_dir: &str,
 		cache_limit: u64,
 		max_downloads: usize,
+		readahead: usize,
 		num_cache_workers: Option<usize>,
 		local_rank: Option<u32>,
 		global_rank: Option<u32>,
@@ -211,6 +213,7 @@ impl Config {
 			socket_name,
 			cache_dir: PathBuf::from(cache_dir),
 			max_downloads,
+			readahead,
 		})
 	}
 }
@@ -238,10 +241,34 @@ impl Config {
 }
 
 
-#[pyclass(frozen, str)]
-struct StreamingDataset {
+#[derive(Deserialize, Serialize)]
+struct ShardRanges {
 	shards: Vec<MDSShardReader>,
 	shards_cum: Vec<u64>,
+}
+
+impl ShardRanges {
+	/// Returns the total number of samples in this dataset.
+	fn total_samples(&self) -> u64 {
+		*self.shards_cum.last().unwrap_or(&0)
+	}
+
+	/// Given a global sample index, returns the (shard_index, offset) tuple.
+	fn index_to_shard(&self, index: usize) -> (usize, usize) {
+		assert!(index < self.total_samples() as usize);
+
+		// Find the shard that contains the sample using binary search
+		let shard_index = self.shards_cum.partition_point(|&b| b <= index as u64) - 1;
+		let offset = index - self.shards_cum[shard_index] as usize;
+
+		(shard_index, offset)
+	}
+}
+
+
+#[pyclass(frozen, str)]
+struct StreamingDataset {
+	shards: Arc<ShardRanges>,
 	stream_ranges: Vec<(u64, u64)>, // [start, end) for each stream (in global sample indices)
 	conn: SocketConnection,
 
@@ -250,13 +277,6 @@ struct StreamingDataset {
 	drop_last: bool,
 	micro_batch_size: usize,
 	config: Config,
-}
-
-impl StreamingDataset {
-	/// Returns the total number of samples in this dataset.
-	fn total_samples(&self) -> u64 {
-		*self.shards_cum.last().unwrap_or(&0)
-	}
 }
 
 #[pymethods]
@@ -304,12 +324,10 @@ impl StreamingDataset {
 		}
 
 		// connection to the cache server
-		let conn = SocketConnection::new(config.get_socket_addr(), config.global_rank as u16)
-			.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?;
+		let conn = SocketConnection::new(config.get_socket_addr(), config.global_rank as u16);
 
 		Ok(StreamingDataset {
-			shards,
-			shards_cum,
+			shards: Arc::new(ShardRanges { shards, shards_cum }),
 			stream_ranges,
 			conn,
 
@@ -323,18 +341,16 @@ impl StreamingDataset {
 
 	/// Read a sample based on its global sample index.
 	fn get_sample<'py>(&self, py: Python<'py>, index: usize, worker_id: u16) -> PyResult<Bound<'py, PyDict>> {
-		if index >= self.total_samples() as usize {
+		if index >= self.shards.total_samples() as usize {
 			return Err(PyValueError::new_err(format!(
 				"Sample index {} out of bounds for dataset with {} samples",
 				index,
-				self.total_samples()
+				self.shards.total_samples()
 			)));
 		}
 
-		// find the shard that contains the sample using binary search
-		let shard_index = self.shards_cum.partition_point(|&b| b <= index as u64) - 1;
-		let offset = index - self.shards_cum[shard_index] as usize;
-		let shard = &self.shards[shard_index];
+		let (shard_index, offset) = self.shards.index_to_shard(index);
+		let shard = &self.shards.shards[shard_index];
 		let shard_hash = shard
 			.hashes
 			.xxh3_128
@@ -360,10 +376,10 @@ impl StreamingDataset {
 	}
 
 	fn __len__(&self) -> usize {
-		self.total_samples() as usize
+		self.shards.total_samples() as usize
 	}
 
-	fn get_indices<'py>(&self, py: Python<'py>, epoch: u64, worker_id: u16, num_workers: u16) -> PyResult<Bound<'py, PyArray1<i64>>> {
+	fn get_iter(&self, epoch: u64, worker_id: u16, num_workers: u16) -> DatasetIterator {
 		let indices = get_work(
 			&self.stream_ranges,
 			self.config.global_rank,
@@ -376,7 +392,8 @@ impl StreamingDataset {
 			self.drop_last,
 			self.micro_batch_size,
 		);
-		Ok(indices.into_pyarray(py))
+
+		DatasetIterator::new(indices, self.shards.clone(), self.config.clone(), worker_id)
 	}
 
 	/// Called to pickle the object.
@@ -385,8 +402,7 @@ impl StreamingDataset {
 	fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
 		#[derive(Serialize)]
 		struct StreamingDatasetState<'a> {
-			shards: &'a [MDSShardReader],
-			shards_cum: &'a [u64],
+			shards: &'a ShardRanges,
 			stream_ranges: &'a [(u64, u64)],
 			seed: &'a [u8],
 			shuffle: bool,
@@ -397,7 +413,6 @@ impl StreamingDataset {
 
 		let snapshot = StreamingDatasetState {
 			shards: &self.shards,
-			shards_cum: &self.shards_cum,
 			stream_ranges: &self.stream_ranges,
 			seed: &self.seed,
 			shuffle: self.shuffle,
@@ -416,8 +431,7 @@ impl StreamingDataset {
 	fn __setstate__(state: Bound<'_, PyDict>) -> PyResult<StreamingDataset> {
 		#[derive(Deserialize)]
 		struct StreamingDatasetState {
-			shards: Vec<MDSShardReader>,
-			shards_cum: Vec<u64>,
+			shards: ShardRanges,
 			stream_ranges: Vec<(u64, u64)>,
 			seed: Vec<u8>,
 			shuffle: bool,
@@ -429,12 +443,10 @@ impl StreamingDataset {
 		let snapshot: StreamingDatasetState =
 			depythonize(&state).map_err(|e| PyValueError::new_err(format!("Failed to depythonize StreamingDataset state: {:?}", e)))?;
 
-		let conn = SocketConnection::new(snapshot.config.get_socket_addr(), snapshot.config.global_rank as u16)
-			.map_err(|e| PyIOError::new_err(format!("Failed to create socket connection: {:?}", e)))?;
+		let conn = SocketConnection::new(snapshot.config.get_socket_addr(), snapshot.config.global_rank as u16);
 
 		Ok(StreamingDataset {
-			shards: snapshot.shards,
-			shards_cum: snapshot.shards_cum,
+			shards: Arc::new(snapshot.shards),
 			stream_ranges: snapshot.stream_ranges,
 			conn,
 
@@ -449,7 +461,107 @@ impl StreamingDataset {
 
 impl Display for StreamingDataset {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "StreamingDataset with {} shards and {} samples", self.shards.len(), self.total_samples())
+		write!(
+			f,
+			"StreamingDataset with {} shards and {} samples",
+			self.shards.shards.len(),
+			self.shards.total_samples()
+		)
+	}
+}
+
+
+#[pyclass(frozen)]
+struct DatasetIterator {
+	inner: Arc<DatasetIteratorInner>,
+}
+
+struct DatasetIteratorInner {
+	indices: Vec<i64>,
+	/// Where indices will be read from next
+	read_index: AtomicUsize,
+}
+
+impl DatasetIterator {
+	fn new(indices: Vec<i64>, dataset: Arc<ShardRanges>, config: Config, worker_id: u16) -> Self {
+		let iter = DatasetIterator {
+			inner: Arc::new(DatasetIteratorInner {
+				indices,
+				read_index: AtomicUsize::new(0),
+			}),
+		};
+
+		// Spawn the readahead thread
+		let iter_clone = iter.inner.clone();
+		thread::spawn(move || {
+			dataset_readahead(iter_clone, dataset, config, worker_id);
+		});
+
+		iter
+	}
+}
+
+#[pymethods]
+impl DatasetIterator {
+	fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+		slf
+	}
+
+	fn __next__(&self) -> Option<i64> {
+		let index = self.inner.read_index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		if index >= self.inner.indices.len() {
+			return None;
+		}
+		Some(self.inner.indices[index])
+	}
+}
+
+impl Drop for DatasetIterator {
+	fn drop(&mut self) {
+		// This will signal the readahead thread to quit.
+		self.inner.read_index.store(self.inner.indices.len(), std::sync::atomic::Ordering::SeqCst);
+	}
+}
+
+fn dataset_readahead(iter: Arc<DatasetIteratorInner>, dataset: Arc<ShardRanges>, config: Config, worker_id: u16) {
+	let conn = SocketConnection::new(config.get_socket_addr(), config.global_rank as u16);
+	let mut index = 0;
+	let total_indices = iter.indices.len();
+
+	loop {
+		let read_index = iter.read_index.load(std::sync::atomic::Ordering::SeqCst);
+		// In case the worker has gotten ahead of us
+		index = index.max(read_index);
+
+		if index >= total_indices {
+			break;
+		}
+
+		if index - read_index >= config.readahead {
+			thread::sleep(std::time::Duration::from_millis(7));
+			continue;
+		}
+
+		let sample_index = iter.indices[index];
+		index += 1;
+
+		if sample_index < 0 {
+			continue;
+		}
+
+		let (shard_index, _) = dataset.index_to_shard(sample_index as usize);
+		let shard = &dataset.shards[shard_index];
+		let Some(shard_hash) = shard.hashes.xxh3_128 else {
+			error!("Shard '{}' does not have xxh3_128 hash", shard.local);
+			continue;
+		};
+
+		info!("[worker={}] readahead {}", worker_id, shard.local);
+
+		if let Err(err) = conn.send_message(shard.remote.as_str(), &shard.local, Some(shard_hash), None, worker_id) {
+			error!("[worker={}] Failed to send message to cache server for readahead: {:?}", worker_id, err);
+			continue;
+		}
 	}
 }
 
@@ -665,7 +777,7 @@ fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, 
 		let socket_addr = socket_addr.clone();
 
 		threads.push(thread::spawn(move || {
-			let conn = SocketConnection::new(socket_addr, global_rank).context("Failed to create socket connection")?;
+			let conn = SocketConnection::new(socket_addr, global_rank);
 
 			while let Some((remote_index, local_index)) = remotes_and_locals.lock().unwrap().pop() {
 				if let Err(err) = conn.send_message(remote_index.as_str(), local_index.as_str(), None, None, 0) {

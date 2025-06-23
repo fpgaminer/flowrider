@@ -26,7 +26,7 @@ class StreamingDataset(IterableDataset):
 		info = torch.utils.data.get_worker_info()
 		worker_id = info.id if info is not None else 0
 		num_workers = info.num_workers if info is not None else 1
-		indices = self._inner.get_indices(self.epoch, worker_id, num_workers)
+		indices = self._inner.get_iter(self.epoch, worker_id, num_workers)
 		for idx in indices:
 			yield self[idx]
 		self.epoch += 1

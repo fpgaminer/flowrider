@@ -63,6 +63,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "setuptools>=48" wheel "setuptools-rust>=1.0" numpy
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
       - name: pip install .
         run: python -m pip install .
 

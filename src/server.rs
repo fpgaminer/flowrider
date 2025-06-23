@@ -323,12 +323,12 @@ fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16
 }
 
 impl SocketConnection {
-	pub fn new(addr: StdSocketAddr, global_rank: u16) -> anyhow::Result<Self> {
-		Ok(SocketConnection {
+	pub fn new(addr: StdSocketAddr, global_rank: u16) -> Self {
+		SocketConnection {
 			addr,
 			global_rank,
 			inner: std::sync::Mutex::new(None),
-		})
+		}
 	}
 
 	/// Sends a message to the server and waits for a response.

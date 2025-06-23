@@ -64,11 +64,14 @@ fn flowrider(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
 	/// Rank of this process on the local node (0 for the first process).
+	#[pyo3(get)]
 	local_rank: u32,
 	/// Rank of this process in the distributed group (between 0 and world size - 1).
+	#[pyo3(get)]
 	global_rank: u32,
 	/// Total number of processes in the distributed group.
 	#[allow(dead_code)]
+	#[pyo3(get)]
 	world_size: u32,
 	/// Name that uniquely identifies the socket for the cache server.
 	socket_name: String,
@@ -275,6 +278,7 @@ struct StreamingDataset {
 	seed: Vec<u8>,
 	shuffle: bool,
 	drop_last: bool,
+	#[pyo3(get)]
 	micro_batch_size: usize,
 	config: Config,
 }
@@ -379,7 +383,7 @@ impl StreamingDataset {
 		self.shards.total_samples() as usize
 	}
 
-	fn get_iter(&self, epoch: u64, worker_id: u16, num_workers: u16) -> DatasetIterator {
+	fn get_iter(&self, epoch: u64, worker_id: u16, num_workers: u16, resume: Option<u64>) -> DatasetIterator {
 		let indices = get_work(
 			&self.stream_ranges,
 			self.config.global_rank,
@@ -391,6 +395,7 @@ impl StreamingDataset {
 			self.shuffle,
 			self.drop_last,
 			self.micro_batch_size,
+			resume,
 		);
 
 		DatasetIterator::new(indices, self.shards.clone(), self.config.clone(), worker_id)
@@ -881,6 +886,7 @@ fn get_work(
 	shuffle: bool,
 	drop_last: bool,
 	micro_batch_size: usize,
+	resume: Option<u64>,
 ) -> Vec<i64> {
 	info!(
 		"[{}-{}] Getting work for epoch {} with seed {:?}, shuffle: {}, drop_last: {}, micro_batch_size: {}",
@@ -937,8 +943,6 @@ fn get_work(
 
 	// Now shape into a 2D array of shape (_, micro_batch_size).
 	let mut chunks: Vec<_> = ids.chunks_exact(micro_batch_size).collect();
-	//let num_micro_batches = ids.len() / micro_batch_size;
-	//let mut ids = Array::from_shape_vec((num_micro_batches, micro_batch_size), ids).expect("Failed to create micro-batch array from IDs");
 
 	// Shuffle the micro-batches if requested.
 	if shuffle {
@@ -955,8 +959,27 @@ fn get_work(
 		.enumerate()
 		.filter_map(|(i, batch)| if i % world_size == global_rank { Some(batch) } else { None });
 
+	let skip = if let Some(resume) = resume {
+		// Resume is the global number of samples seen across all ranks and workers.
+		// Calculate how many micro-batches have been seen globally.
+		assert!(resume % micro_batch_size as u64 == 0, "Resume index must be a multiple of micro_batch_size");
+		let global_micro_batches_seen = resume / micro_batch_size as u64;
+		// How many micro-batches have been seen by this rank?
+		assert!(
+			resume % world_size as u64 == 0,
+			"Resume index must be a multiple of world_size * micro_batch_size"
+		);
+		let rank_micro_batches_seen = global_micro_batches_seen / world_size as u64;
+
+		// Skip ahead
+		rank_micro_batches_seen as usize
+	} else {
+		0
+	};
+
 	// Select the micro-batches for this worker, also round-robin.
 	let ids = ids
+		.skip(skip)
 		.enumerate()
 		.filter_map(|(i, batch)| if i % num_workers as usize == worker_id as usize { Some(batch) } else { None })
 		.flatten()
@@ -1209,6 +1232,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			2,     // micro_batch_size
+			None,
 		);
 
 		// Should get all samples: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -1230,6 +1254,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			2,     // micro_batch_size
+			None,
 		);
 
 		// Should get all samples in order: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -1251,6 +1276,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last (padding enabled)
 			2,     // micro_batch_size
+			None,
 		);
 
 		// Should pad: [0, 1, 2, 3, 4, -1]
@@ -1272,6 +1298,7 @@ mod tests {
 			false, // shuffle
 			true,  // drop_last (truncation enabled)
 			2,     // micro_batch_size
+			None,
 		);
 
 		// Should truncate: [0, 1, 2, 3] (last sample dropped)
@@ -1297,6 +1324,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			micro_batch_size,
+			None,
 		);
 
 		// Get work for rank 1
@@ -1311,6 +1339,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			micro_batch_size,
+			None,
 		);
 
 		// Rank 0 should get micro-batches 0, 2 -> [0, 1, 4, 5]
@@ -1338,6 +1367,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			micro_batch_size,
+			None,
 		);
 
 		// Get work for worker 1
@@ -1352,6 +1382,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			micro_batch_size,
+			None,
 		);
 
 		// Worker 0 should get micro-batches 0, 2 -> [0, 1, 4, 5]
@@ -1378,6 +1409,7 @@ mod tests {
 			true,  // shuffle
 			false, // drop_last
 			2,     // micro_batch_size
+			None,
 		);
 
 		let work2 = get_work(
@@ -1391,6 +1423,7 @@ mod tests {
 			true,  // shuffle
 			false, // drop_last
 			2,     // micro_batch_size
+			None,
 		);
 
 		// Should be identical
@@ -1408,6 +1441,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			2,     // micro_batch_size
+			None,
 		);
 
 		assert_ne!(work1, work_no_shuffle);
@@ -1430,6 +1464,7 @@ mod tests {
 			true,  // shuffle
 			false, // drop_last
 			2,     // micro_batch_size
+			None,
 		);
 
 		let work_epoch1 = get_work(
@@ -1443,6 +1478,7 @@ mod tests {
 			true,  // shuffle
 			false, // drop_last
 			2,     // micro_batch_size
+			None,
 		);
 
 		// Should be different (very high probability)
@@ -1466,6 +1502,7 @@ mod tests {
 			false, // shuffle
 			false, // drop_last
 			micro_batch_size,
+			None,
 		);
 
 		// Check that each micro-batch contains samples from only one stream
@@ -1531,6 +1568,7 @@ mod tests {
 							shuffle,
 							false,
 							micro_batch_size,
+							None,
 						));
 					}
 					ranks.push(workers);
@@ -1602,6 +1640,7 @@ mod tests {
 					false, // shuffle
 					false, // drop_last
 					micro_batch_size,
+					None,
 				);
 
 				// Collect all non-padding samples
@@ -1665,6 +1704,7 @@ mod tests {
 				false, // shuffle
 				false, // drop_last (padding enabled)
 				micro_batch_size,
+				None,
 			);
 			all_work.push(work);
 		}
@@ -1708,6 +1748,7 @@ mod tests {
 				false, // shuffle
 				true,  // drop_last
 				micro_batch_size,
+				None,
 			);
 
 			if !work.is_empty() {
@@ -1737,6 +1778,7 @@ mod tests {
 				false, // shuffle
 				false, // drop_last (padding enabled)
 				micro_batch_size,
+				None,
 			);
 
 			if !work.is_empty() {
@@ -1747,5 +1789,167 @@ mod tests {
 
 		// With padding, all ranks should get equal work
 		assert_eq!(ranks_with_work_padded, world_size, "All ranks should get work when padding is enabled");
+	}
+
+	/// Simulates one epoch across ranks and workers, returning the sequential IDs.
+	fn simulate_run(
+		stream_ranges: &[(u64, u64)],
+		world_size: u32,
+		num_workers: u16,
+		micro_batch_size: usize,
+		batch_size: usize,
+		seed: &[u8],
+		epoch: u64,
+		shuffle: bool,
+		drop_last: bool,
+		resume: Option<u64>,
+	) -> Vec<i64> {
+		let mut all_ids: Vec<i64> = Vec::new();
+		let mut worker_offsets = vec![0; world_size as usize];
+		let mut workers_work = Vec::new();
+
+		assert!(
+			batch_size % (world_size as usize * micro_batch_size) == 0,
+			"Batch size must be divisible by world_size * micro_batch_size"
+		);
+
+		for rank in 0..world_size {
+			let mut rank_work = Vec::new();
+			for worker_id in 0..num_workers {
+				let work = get_work(
+					stream_ranges,
+					rank,
+					world_size,
+					worker_id,
+					num_workers,
+					seed,
+					epoch,
+					shuffle,
+					drop_last,
+					micro_batch_size,
+					resume,
+				);
+				rank_work.push(work);
+			}
+			workers_work.push(rank_work);
+		}
+
+		loop {
+			let mut batch = Vec::new();
+
+			for _ in 0..(batch_size / (world_size as usize * micro_batch_size)) {
+				for rank in 0..world_size {
+					let worker_id = worker_offsets[rank as usize];
+					let work = &mut workers_work[rank as usize][worker_id as usize];
+					if work.is_empty() {
+						continue;
+					}
+
+					batch.extend(work.drain(..micro_batch_size));
+					worker_offsets[rank as usize] = (worker_id + 1) % num_workers;
+				}
+			}
+
+			if batch.len() < batch_size {
+				break;
+			}
+
+			all_ids.extend(batch);
+		}
+
+		all_ids
+	}
+
+	#[test]
+	fn get_work_resume() {
+		let stream_ranges = vec![(0, 12), (12, 20), (20, 256)];
+		let micro_batch_size = 4;
+		let world_size = 4;
+
+		// Results of a full run
+		let mut full_work = simulate_run(&stream_ranges, world_size, 2, micro_batch_size, 16, b"seed", 0, true, true, None);
+
+		// Drop the first batch to simulate interruption
+		full_work.drain(0..16);
+
+		// Run with resume
+		let resumed_work = simulate_run(&stream_ranges, world_size, 2, micro_batch_size, 16, b"seed", 0, true, true, Some(16));
+		assert_eq!(&full_work, &resumed_work, "Resumed work should match full work minus the dropped batch");
+
+		// Resuming with a different number of workers shouldn't matter
+		let resumed_work = simulate_run(&stream_ranges, world_size, 3, micro_batch_size, 16, b"seed", 0, true, true, Some(16));
+		assert_eq!(
+			full_work, resumed_work,
+			"Resumed work with different num_workers should match full work minus the dropped batch: full_work={:?}, resumed_work={:?}",
+			full_work, resumed_work
+		);
+
+		// Should also be able to resume with a different world size
+		let resumed_work = simulate_run(&stream_ranges, 2, 2, micro_batch_size, 16, b"seed", 0, true, true, Some(16));
+		assert_eq!(
+			full_work, resumed_work,
+			"Resumed work with different world_size should match full work minus the dropped batch: full_work={:?}, resumed_work={:?}",
+			full_work, resumed_work
+		);
+	}
+
+	#[test]
+	fn get_work_resume_jagged() {
+		// Tests that resume works even if the dataset isn't evenly divisible (and thus makes use of drop last or padding)
+		let stream_ranges = vec![(0, 11), (11, 31), (31, 297)];
+		let micro_batch_size = 4;
+		let world_size = 4;
+
+		// Results of a full run
+		let mut full_work = simulate_run(&stream_ranges, world_size, 2, micro_batch_size, 16, b"seed", 0, true, true, None);
+
+		// Drop the first batch to simulate interruption
+		full_work.drain(0..16);
+
+		// Run with resume
+		let resumed_work = simulate_run(&stream_ranges, world_size, 2, micro_batch_size, 16, b"seed", 0, true, true, Some(16));
+		assert_eq!(&full_work, &resumed_work, "Resumed work should match full work minus the dropped batch");
+
+		// Resuming with a different number of workers shouldn't matter
+		let resumed_work = simulate_run(&stream_ranges, world_size, 3, micro_batch_size, 16, b"seed", 0, true, true, Some(16));
+		assert_eq!(
+			full_work, resumed_work,
+			"Resumed work with different num_workers should match full work minus the dropped batch: full_work={:?}, resumed_work={:?}",
+			full_work, resumed_work
+		);
+
+		// Should also be able to resume with a different world size
+		let resumed_work = simulate_run(&stream_ranges, 2, 2, micro_batch_size, 16, b"seed", 0, true, true, Some(16));
+		assert_eq!(
+			full_work, resumed_work,
+			"Resumed work with different world_size should match full work minus the dropped batch: full_work={:?}, resumed_work={:?}",
+			full_work, resumed_work
+		);
+
+		// Results of a full run, this time with padding
+		let mut full_work = simulate_run(&stream_ranges, world_size, 2, micro_batch_size, 16, b"seed", 0, true, false, None);
+
+		// Drop the first batch to simulate interruption
+		full_work.drain(0..16);
+
+		// Run with resume
+		let resumed_work = simulate_run(&stream_ranges, world_size, 2, micro_batch_size, 16, b"seed", 0, true, false, Some(16));
+		assert_eq!(&full_work, &resumed_work, "Resumed work should match full work minus the dropped batch");
+
+		// Resuming with a different number of workers shouldn't matter
+		let resumed_work = simulate_run(&stream_ranges, world_size, 3, micro_batch_size, 16, b"seed", 0, true, false, Some(16));
+		assert_eq!(
+			full_work, resumed_work,
+			"Resumed work with different num_workers should match full work minus the dropped batch: full_work={:?}, resumed_work={:?}",
+			full_work, resumed_work
+		);
+
+		// Should also be able to resume with a different world size
+		let resumed_work = simulate_run(&stream_ranges, 2, 2, micro_batch_size, 16, b"seed", 0, true, false, Some(16));
+		assert_eq!(
+			full_work, resumed_work,
+			"Resumed work with different world_size should match full work minus the dropped batch: full_work={:?}, resumed_work={:?}",
+			full_work, resumed_work
+		);
 	}
 }

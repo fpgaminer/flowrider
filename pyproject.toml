@@ -1,11 +1,42 @@
 [build-system]
-requires = [
-	"setuptools >= 48",
-	"wheel",
-	"setuptools-rust >= 1.0"
-]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
 
-[[tool.setuptools-rust.ext-modules]]
-target = "flowrider.flowrider"
-binding = "PyO3"
+[project]
+name = "flowrider"
+dynamic = ["version"]
+description = "High-performance PyTorch-compatible streaming dataset with distributed caching for on-the-fly remote shard fetching"
+readme = {file = "README.md", content-type = "text/markdown"}
+license = {text = "Apache-2.0"}
+authors = [{name = "fpgaminer", email = "fpgaminer@bitcoin-mining.com"}]
+requires-python = ">=3.9"
+keywords = ["pytorch", "dataset", "streaming", "distributed", "machine-learning", "deep-learning", "cache", "mds"]
+classifiers = [
+	"Development Status :: 3 - Alpha",
+	"License :: OSI Approved :: Apache Software License",
+	"Intended Audience :: Developers",
+	"Intended Audience :: Science/Research",
+	"Programming Language :: Python :: 3",
+	"Programming Language :: Python :: 3.9",
+	"Programming Language :: Python :: 3.10",
+	"Programming Language :: Python :: 3.11",
+	"Programming Language :: Python :: 3.12",
+	"Programming Language :: Python :: 3 :: Only",
+	"Programming Language :: Rust",
+	"Topic :: Software Development :: Libraries :: Python Modules",
+	"Topic :: Scientific/Engineering :: Artificial Intelligence",
+	"Topic :: System :: Distributed Computing",
+	"Operating System :: POSIX :: Linux",
+	"Operating System :: Unix",
+	"Environment :: GPU",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/fpgaminer/flowrider"
+Documentation = "https://github.com/fpgaminer/flowrider#readme"
+Source = "https://github.com/fpgaminer/flowrider"
+"Bug Tracker" = "https://github.com/fpgaminer/flowrider/issues"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]

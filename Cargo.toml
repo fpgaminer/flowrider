@@ -22,15 +22,14 @@ tempfile = "3"
 moka = { version = "0.12", features = ["future"] }
 futures = "0.3"
 async-recursion = "1.1.1"
-libc = "0.2.174"
 rand = "0.9.1"
 rand_chacha = "0.9.0"
-ndarray = "0.16.1"
-numpy = "0.25.0"
-pythonize = "0.25.0"
-log = "0.4.27"
-env_logger = "0.11.8"
-rust-s3 = "0.35.1"
+ndarray = "0.16"
+numpy = "0.25"
+pythonize = "0.25"
+log = "0.4"
+env_logger = "0.11"
+rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustls-tls"] }
 
 [features]
 extension-module = ["pyo3/extension-module"]

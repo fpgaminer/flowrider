@@ -5,3 +5,6 @@ Cargo.lock
 __pycache__
 *.so
 /test-cache
+*.log
+*.pt
+*.ipynb

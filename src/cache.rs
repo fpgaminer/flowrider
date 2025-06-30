@@ -37,9 +37,9 @@ impl ShardCache {
 					}
 
 					if let Err(err) = tokio::fs::remove_file(Path::new(&*key)).await {
-						warn!("Cache failed to remove file {}: {}", key, err);
+						warn!("Cache failed to remove file {key}: {err:?}");
 					}
-					info!("Cache removed file {}", key);
+					info!("Cache removed file {key}");
 				}
 				.boxed()
 			});
@@ -106,7 +106,7 @@ impl ShardCache {
 		}
 	}
 
-	pub async fn get_shard(&self, remote: Url, local: &str, expected_hash: Option<u128>, download_semaphore: &Semaphore) -> anyhow::Result<Arc<ShardMeta>> {
+	pub async fn get_shard(&self, remote: Url, local: &str, download_semaphore: &Semaphore) -> anyhow::Result<Arc<ShardMeta>> {
 		// local path must be valid
 		// since local paths cannot have traversal components, we guarantee they can be used as unique keys in the cache
 		// (this assumes no symlinked directories or other tricks in the cache directory)
@@ -136,7 +136,7 @@ impl ShardCache {
 				.parent()
 				.ok_or_else(|| anyhow::anyhow!("Remote URL '{}' does not have a parent directory", remote))?
 				.canonicalize()
-				.with_context(|| format!("Failed to canonicalize remote path: {}", remote))?;
+				.with_context(|| format!("Failed to canonicalize remote path: {remote}"))?;
 			let local_path = local_cache_path
 				.parent()
 				.ok_or_else(|| anyhow::anyhow!("Local cache path '{}' does not have a parent directory", local_cache_path.display()))?;
@@ -155,12 +155,12 @@ impl ShardCache {
 			.to_str()
 			.ok_or_else(|| anyhow::anyhow!("Local cache path '{}' is not valid UTF-8", local_cache_path.display()))?;
 
-		// If the shard is in the cache, we can return immediately.
+		// If the file is in the cache, we can return immediately.
 		// Otherwise, moka's Cache ensures that only a single instance of download_shard will run concurrently for the same key.
 		// Once the download is complete, it will be cached and we (and all other waiting tasks) can return.
 		match self
 			.cache
-			.try_get_with_by_ref(local, download_shard(&remote, local_cache_path, expected_hash, download_semaphore))
+			.try_get_with_by_ref(local, download_shard(&remote, local_cache_path, download_semaphore))
 			.await
 		{
 			Ok(meta) => {
@@ -173,10 +173,10 @@ impl ShardCache {
 						remote
 					);
 				}
-				info!("Using cached shard at {}", local);
+				info!("Using cached shard at {local}");
 				Ok(meta)
 			},
-			Err(e) => Err(anyhow::anyhow!("Failed to get shard {}: {}", local, e)),
+			Err(e) => Err(anyhow::anyhow!("Failed to get shard {}: {:?}", local, e)),
 		}
 	}
 }
@@ -222,23 +222,23 @@ fn is_local_path_valid(path: &str) -> bool {
 }
 
 
-async fn download_shard(remote: &Url, local: &str, expected_hash: Option<u128>, download_semaphore: &Semaphore) -> anyhow::Result<Arc<ShardMeta>> {
+async fn download_shard(remote: &Url, local: &str, download_semaphore: &Semaphore) -> anyhow::Result<Arc<ShardMeta>> {
 	let start = Instant::now();
-	crate::server::download_file(remote, local, expected_hash, download_semaphore).await?;
+	crate::server::download_file(remote, local, download_semaphore).await?;
 
 	let bytes = tokio::fs::metadata(local)
 		.await
-		.context(format!("Failed to get metadata for shard at {}", local))?
+		.context(format!("Failed to get metadata for shard at {local}"))?
 		.len()
 		.try_into()
-		.context(format!("Shard at {} is too large", local))?;
+		.context(format!("Shard at {local} is too large"))?;
 	let meta = Arc::new(ShardMeta {
 		bytes,
 		remote: Some(remote.clone()),
 	});
 
 	let elapsed = start.elapsed();
-	info!("Downloaded shard {} in {:?}", local, elapsed);
+	info!("Downloaded file {local} in {elapsed:?}");
 
 	Ok(meta)
 }

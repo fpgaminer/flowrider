@@ -1,15 +1,16 @@
 from .flowrider import StreamingDataset as StreamingDatasetRust
-from .flowrider import Config
+from .flowrider import Config, ColumnEncoding, SampleWriter
 from torch.utils.data import IterableDataset, DataLoader
 import torch
 from collections.abc import Mapping, Sequence
-import itertools
 
 
 __all__ = [
 	'StreamingDataset',
 	'Config',
 	'StreamingDataLoader',
+	'ColumnEncoding',
+	'SampleWriter',
 ]
 
 
@@ -59,15 +60,12 @@ class StreamingDataset(IterableDataset):
 
 
 class StreamingDataLoader(DataLoader):
-	def __init__(self, global_batch_size: int, *args, **kwargs):
+	def __init__(self, *args, **kwargs):
 		dataset = kwargs.get('dataset', None)
 		assert isinstance(dataset, StreamingDataset), "Dataset must be an instance of StreamingDataset"
 		super().__init__(batch_size=dataset.micro_batch_size, *args, **kwargs)
 		self._samples_seen: int = 0
 		self._epoch: int = 0
-		self.global_batch_size = global_batch_size
-		assert global_batch_size % self.dataset.config.world_size == 0, "Global batch size must be divisible by world size"
-		self.rank_batch_size = global_batch_size // self.dataset.config.world_size
 	
 	@property
 	def samples_seen(self) -> int:
@@ -83,32 +81,11 @@ class StreamingDataLoader(DataLoader):
 		assert isinstance(self.dataset, StreamingDataset), "Dataset must be an instance of StreamingDataset"
 		self.dataset.epoch = self._epoch
 		self.dataset._resume = self._samples_seen
-		batch_accum = []
 
 		for batch in super().__iter__():
 			batch_size = self._infer_batch_size(batch)
-
-			# Batch accumulation logic
-			# Some libraries have broken logic when it comes to handling gradient accumulation and expect the dataloader to yield full batches (instead of micro-batches).
-			# To work around this the user can set batch_size to the micro batch size and global_batch_size to the desired global batch size.
-			# This code will accumulate micro-batches before yielding a full device batch.
-			if self.batch_size < self.rank_batch_size:
-				batch_accum.append((batch, batch_size))
-				batch_accum_size = sum(sz for _, sz in batch_accum)
-				if batch_accum_size >= self.rank_batch_size:
-					self._samples_seen += batch_accum_size
-					yield self.concat_batches([b for b,_ in batch_accum])
-					batch_accum = []
-			else:
-				self._samples_seen += self._infer_batch_size(batch)
-				yield batch
-		
-		if len(batch_accum) > 0 and self.drop_last is False:
-			# Pad the last batch if requested and needed
-			batch_accum = self.concat_batches([b for b,_ in batch_accum])
-			batch_accum = self.pad_batch(batch_accum, self.rank_batch_size)
-			self._samples_seen += self._infer_batch_size(batch_accum)
-			yield batch_accum
+			self._samples_seen += batch_size
+			yield batch
 		
 		self._epoch += 1
 		self._samples_seen = 0
@@ -144,33 +121,3 @@ class StreamingDataLoader(DataLoader):
 			return len(batch)
 		
 		raise  TypeError(f"Cannot infer batch size of type {type(batch)}")
-	
-	def concat_batches(self, batches: list):
-		"""Concatenate a list of batches into a single batch. This default implementation handles common batch types (tensor, mapping, sequence)."""
-		if len(batches) == 0:
-			raise ValueError("No batches to concatenate")
-		
-		first_batch = batches[0]
-		if torch.is_tensor(first_batch):
-			return torch.cat(batches, dim=0)
-		
-		if isinstance(first_batch, Mapping):
-			return {k: self.concat_batches([b[k] for b in batches]) for k in first_batch}
-		
-		if isinstance(first_batch, Sequence):
-			return list(itertools.chain.from_iterable(batches))
-		
-		raise TypeError(f"Cannot concatenate batches of type {type(first_batch)}")
-	
-	def pad_batch(self, batch, target_size: int):
-		"""Pad a batch to the target size. This default implementation handles common batch types (tensor, mapping, sequence), and pads by calling the dataset with a -1 index."""
-		current_size = self._infer_batch_size(batch)
-		if current_size >= target_size:
-			return batch  # No padding needed
-		
-		padding = [self.dataset[-1] for _ in range(target_size - current_size)]
-		padding_batch = self._collate_fn(padding)
-
-		return self.concat_batches([batch, padding_batch])
-
-

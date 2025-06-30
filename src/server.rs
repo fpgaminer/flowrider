@@ -29,7 +29,7 @@ use crate::{OptionPythonExt, cache::ShardCache, std_sleep_allow_threads};
 
 pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, cache_dir: String, worker_threads: usize) {
 	let socket_addr =
-		StdSocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap_or_else(|_| panic!("Failed to create abstract socket address: {}", socket_name));
+		StdSocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap_or_else(|_| panic!("Failed to create abstract socket address: {socket_name}"));
 
 	let rt = runtime::Builder::new_multi_thread()
 		.worker_threads(worker_threads)
@@ -40,14 +40,14 @@ pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, c
 	info!("Starting Flowrider cache server...");
 	rt.block_on(async {
 		if let Err(e) = server(socket_addr, cache_limit, max_downloads, cache_dir).await {
-			error!("Error in server: {}", e);
+			error!("Error in server: {e}");
 		}
 	});
 }
 
 
 // TODO: Timeout
-pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_hash: Option<u128>, semaphore: &Semaphore) -> anyhow::Result<()> {
+pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, semaphore: &Semaphore) -> anyhow::Result<()> {
 	let dest_path = dest_path.as_ref();
 	let dest_parent = dest_path
 		.parent()
@@ -107,52 +107,33 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 				))?;
 			},
 			"s3" => {
-				// Get the S3 endpoint URL and credentials
-				let endpoint_url = env::var("S3_ENDPOINT_URL").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-				let credentials = s3::creds::Credentials::default().context("Failed to get S3 credentials")?;
-
-				info!(
-					"Downloading S3 object, endpoint: {}, bucket: {}, key: {}",
-					endpoint_url,
-					url.host_str().unwrap_or(""),
-					url.path()
-				);
-
-				// Create the S3 bucket client
-				let bucket_name = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URL: {}", url))?;
-				let bucket = Bucket::new(
-					bucket_name,
-					s3::Region::Custom {
-						region: "us-east-1".to_string(),
-						endpoint: endpoint_url,
-					},
-					credentials,
-				)
-				.context("Failed to establish S3 connection")?
-				.with_path_style();
-
-				// Download the object from S3
-				let response_data = bucket.get_object(url.path()).await.context(format!("Failed to download S3 object: {}", url))?;
-				if response_data.status_code() != 200 {
-					bail!("Failed to download S3 object: {}. Status code: {}", url, response_data.status_code());
+				if let Err(err) = s3_download(url.clone(), &tmp_path).await {
+					// If the download fails, we log the error and continue to retry
+					warn!("Failed to download S3 object: {url}. Will retry. Error: {err:?}");
+					tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+					continue;
 				}
-
-				// Write the object data to the temporary file
-				fs::write(&tmp_path, response_data.as_slice())
-					.await
-					.context(format!("Failed to write S3 object to temporary file: {}", tmp_path.display()))?;
 			},
 			_ => bail!("Unsupported URL scheme: {}", url.scheme()),
 		}
 
 		// Verify the hash of the downloaded file
-		if let Some(expected_hash) = expected_hash {
+		// Does not apply to the index.json file
+		if dest_path
+			.extension()
+			.and_then(|s| s.to_str())
+			.is_none_or(|ext| !ext.eq_ignore_ascii_case("json"))
+		{
 			let mut file = fs::File::open(&tmp_path).await.context("Failed to open temporary file for hashing")?;
 			let mut hasher = xxhash_rust::xxh3::Xxh3::new();
 			let mut buffer = [0; 8192];
 
+			// Expected hash is the first 16 bytes of the file
+			file.read_exact(&mut buffer[..16]).await.context("Failed to read expected hash from file")?;
+			let expected_hash = u128::from_le_bytes(buffer[..16].try_into().context("Failed to read expected hash from file")?);
+
 			loop {
-				let bytes_read = file.read(&mut buffer).await.context("Failed to read from temporary file")?;
+				let bytes_read = file.read(&mut buffer).await.context("Failed to read from temporary file for hashing")?;
 				if bytes_read == 0 {
 					break; // EOF
 				}
@@ -180,6 +161,50 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, expected_has
 }
 
 
+/// Downloads an S3 object at the given URL to the specified path.
+async fn s3_download<P: AsRef<Path>>(url: Url, tmp_path: P) -> anyhow::Result<()> {
+	// Get the S3 endpoint URL and credentials
+	let endpoint_url = env::var("S3_ENDPOINT_URL").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
+	let credentials = s3::creds::Credentials::default().context("Failed to get S3 credentials")?;
+
+	info!(
+		"Downloading S3 object, endpoint: {}, bucket: {}, key: {}",
+		endpoint_url,
+		url.host_str().unwrap_or(""),
+		url.path()
+	);
+
+	// Create the S3 bucket client
+	let bucket_name = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URL: {}", url))?;
+	let bucket = Bucket::new(
+		bucket_name,
+		s3::Region::Custom {
+			region: "us-east-1".to_string(),
+			endpoint: endpoint_url,
+		},
+		credentials,
+	)
+	.with_context(|| format!("Failed to establish S3 connection for bucket: {bucket_name}"))?
+	.with_path_style();
+
+	// Download the object from S3
+	let file = fs::File::create(&tmp_path)
+		.await
+		.with_context(|| format!("Failed to create temporary file: {}", tmp_path.as_ref().display()))?;
+	let mut file_writer = tokio::io::BufWriter::new(file);
+	let status_code = bucket
+		.get_object_to_writer(url.path(), &mut file_writer)
+		.await
+		.with_context(|| format!("Failed to download S3 object: {url}"))?;
+	if status_code != 200 {
+		bail!("Failed to download S3 object: {}. Status code: {}", url, status_code);
+	}
+	file_writer.flush().await.context("Failed to flush file writer")?;
+
+	Ok(())
+}
+
+
 /// This is the main driver of the caching server.
 /// It handles requests for shards from clients, downloading them and reaping shards to keep the cache size below the limit.
 pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize, cache_dir: String) -> std::io::Result<()> {
@@ -190,7 +215,7 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 	let std_listener = StdUnixListener::bind_addr(&addr)?;
 	std_listener.set_nonblocking(true)?;
 	let listener = UnixListener::from_std(std_listener)?;
-	info!("Flowrider Server listening on {:?}", addr);
+	info!("Flowrider Server listening on {addr:?}");
 
 	loop {
 		let (mut stream, _) = listener.accept().await?;
@@ -205,7 +230,7 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 					return;
 				},
 				Err(e) => {
-					error!("Failed to read client rank: {:?}", e);
+					error!("Failed to read client rank: {e:?}");
 					return;
 				},
 			};
@@ -213,10 +238,7 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 			let client_worker_id = client_rank & 0xFFFF;
 
 			if let Err(e) = handle_connection(stream, cache, download_semaphore).await {
-				error!(
-					"an error occurred while handling connection from rank={},worker={}: {:?}",
-					client_rank, client_worker_id, e
-				);
+				error!("an error occurred while handling connection from rank={client_rank},worker={client_worker_id}: {e:?}");
 			}
 		});
 	}
@@ -245,16 +267,14 @@ async fn handle_connection(mut stream: UnixStream, cache: ShardCache, download_s
 		buf.resize(message_len as usize, 0);
 		stream.read_exact(&mut buf).await?;
 
-		// Payload format: remote_uri (string), local_path (string), expected_hash (u128)
+		// Payload format: remote_uri (string), local_path (string)
 		let mut cursor = std::io::Cursor::new(&buf);
 		let remote = read_string(&mut cursor).context("Failed to read remote URI")?;
 		let local = read_string(&mut cursor).context("Failed to read local path")?;
-		let expected_hash = ReadBytesExt::read_u128::<byteorder::LittleEndian>(&mut cursor).context("Failed to read expected hash")?;
-		info!("Received request for {} -> {} ({:032x})", remote, local, expected_hash);
-		let expected_hash = if expected_hash == 0 { None } else { Some(expected_hash) };
+		info!("Received request for {remote} -> {local})");
 
 		// parse remote URI
-		let remote_uri = Url::parse(&remote).context(format!("Failed to parse remote URI: {}", remote))?;
+		let remote_uri = Url::parse(&remote).context(format!("Failed to parse remote URI: {remote}"))?;
 
 		// local path must be a relative path, since it will be joined with the cache directory
 		ensure!(Path::new(&local).is_relative(), "Local path '{}' must be a relative path", local);
@@ -262,7 +282,7 @@ async fn handle_connection(mut stream: UnixStream, cache: ShardCache, download_s
 		// Get shard from cache
 		// If it isn't in the cache, this will trigger a download
 		// Once this returns, we can assume the shard is available at its local path (at least for awhile).
-		cache.get_shard(remote_uri, &local, expected_hash, &download_semaphore).await?;
+		cache.get_shard(remote_uri, &local, &download_semaphore).await?;
 
 		stream.write_u8(1u8).await?;
 	}
@@ -303,7 +323,7 @@ fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16
 
 				// introduce ourselves to the server
 				if let Err(e) = py.allow_threads(|| stream.write_u32::<byteorder::LittleEndian>(ranks)) {
-					warn!("Failed to send ranks to server (will retry): {:?}", e);
+					warn!("Failed to send ranks to server (will retry): {e:?}");
 					std_sleep_allow_threads(std::time::Duration::from_millis(1000), py);
 					continue;
 				}
@@ -315,7 +335,7 @@ fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16
 				std_sleep_allow_threads(std::time::Duration::from_millis(100), py);
 			},
 			Err(e) => {
-				warn!("Failed to connect to socket at {:?} (will retry): {:?}", addr, e);
+				warn!("Failed to connect to socket at {addr:?} (will retry): {e:?}");
 				std_sleep_allow_threads(std::time::Duration::from_millis(1000), py);
 			},
 		}
@@ -336,14 +356,7 @@ impl SocketConnection {
 	/// `remote_uri` must fit in a u16, so it must be less than 65536 bytes.
 	/// `local_path` must also fit in a u16, so it must be less than 65536 bytes.
 	/// The server is always expected to respond with 1.
-	pub fn send_message<'py>(
-		&self,
-		remote_uri: &str,
-		local_path: &str,
-		expected_hash: Option<u128>,
-		py: Option<Python<'py>>,
-		worker_id: u16,
-	) -> anyhow::Result<u8> {
+	pub fn send_message<'py>(&self, remote_uri: &str, local_path: &str, py: Option<Python<'py>>, worker_id: u16) -> anyhow::Result<u8> {
 		// Prevent concurrent usage.
 		let mut guard = if let Some(py) = py {
 			self.inner.lock_py_attached(py)
@@ -353,13 +366,9 @@ impl SocketConnection {
 		.map_err(|e| anyhow::anyhow!("Failed to lock socket connection: {:?}", e))?;
 
 		// TODO: Timeout
-		let mut buf = Vec::new();
+		let mut buf = vec![0u8; 4]; // 4 bytes for the message length
 		let remote_uri_len: u16 = remote_uri.len().try_into().expect("remote_uri length should fit in u16");
 		let local_path_len: u16 = local_path.len().try_into().expect("local_path length should fit in u16");
-
-		// Write the message length
-		let message_len = 2 + remote_uri.len() + 2 + local_path.len() + 16; // 2 for remote_uri length, 2 for local_path length, 16 for expected_hash
-		WriteBytesExt::write_u32::<byteorder::LittleEndian>(&mut buf, message_len as u32)?;
 
 		// Write the remote URI
 		WriteBytesExt::write_u16::<byteorder::LittleEndian>(&mut buf, remote_uri_len)?;
@@ -369,8 +378,9 @@ impl SocketConnection {
 		WriteBytesExt::write_u16::<byteorder::LittleEndian>(&mut buf, local_path_len)?;
 		buf.extend_from_slice(local_path.as_bytes());
 
-		// Write the expected hash
-		WriteBytesExt::write_u128::<byteorder::LittleEndian>(&mut buf, expected_hash.unwrap_or(0))?;
+		// Inject the message length at the start of the buffer.
+		let message_len: u32 = (buf.len() - 4).try_into().expect("Message length should fit in u32");
+		buf[..4].copy_from_slice(&message_len.to_le_bytes());
 
 		// We pull the connection out of the Mutex<Option<>>.  If anything goes wrong, the connection may be left in an inconsistent state.
 		// By taking the connection, we know it'll be dropped if anything goes wrong, and we can re-establish it on the next call.
@@ -387,14 +397,21 @@ impl SocketConnection {
 
 		// Wait for a response (1 byte)
 		// We use a loop with a short read timeout so we can repeatedly call `check_signals` in the loop to handle ctrl+c, etc.
+		let start = std::time::Instant::now();
+		let mut time_warning_issued = false;
 		let response = loop {
 			py.check_signals()?;
+
+			if start.elapsed() > std::time::Duration::from_secs(60) && !time_warning_issued {
+				warn!("Waiting for response from server took longer than 60 seconds. This may indicate a problem with the server.");
+				time_warning_issued = true;
+			}
 
 			match py.allow_threads(|| stream.read_u8()) {
 				Ok(response) => {
 					break response;
 				},
-				Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+				Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
 					continue;
 				},
 				Err(e) => {

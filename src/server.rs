@@ -426,3 +426,111 @@ impl SocketConnection {
 		Ok(response)
 	}
 }
+
+
+#[cfg(test)]
+mod tests {
+	use crate::server::start_server;
+
+	use super::{SocketConnection, read_string};
+	use byteorder::{LittleEndian, WriteBytesExt};
+	use rand::Rng;
+	use std::{
+		fs,
+		io::{Cursor, Read},
+		os::{linux::net::SocketAddrExt, unix::net::SocketAddr as StdSocketAddr},
+		path::PathBuf,
+		thread,
+	};
+	use tempfile::TempDir;
+	use url::Url;
+
+	// ──────────────────────── read_string ──────────────────────────
+	#[test]
+	fn read_string_happy_and_error_paths() {
+		// Empty ⇒ ""
+		let mut buf = Vec::<u8>::new();
+		buf.write_u16::<LittleEndian>(0).unwrap();
+		assert_eq!(read_string(&mut Cursor::new(buf)).unwrap(), "");
+
+		// Non-empty ASCII
+		let mut buf = Vec::new();
+		let payload = b"hello!";
+		buf.write_u16::<LittleEndian>(payload.len() as u16).unwrap();
+		buf.extend_from_slice(payload);
+		assert_eq!(read_string(&mut Cursor::new(buf)).unwrap(), "hello!");
+
+		// Invalid UTF-8 should error
+		let mut bad = Vec::new();
+		bad.write_u16::<LittleEndian>(2).unwrap();
+		bad.extend_from_slice(&[0xff, 0xff]); // not UTF-8
+		assert!(read_string(&mut Cursor::new(bad)).is_err());
+
+		// Truncated stream -> error
+		let mut short = Vec::new();
+		short.write_u16::<LittleEndian>(10).unwrap(); // claims 10, gives 3
+		short.extend_from_slice(b"abc");
+		assert!(read_string(&mut Cursor::new(short)).is_err());
+	}
+
+	// Helper to build a minimal “shard” file with Flowrider hash header
+	fn make_sample_file(dir: &TempDir, name: &str, payload: &[u8]) -> PathBuf {
+		use xxhash_rust::xxh3::xxh3_128;
+		let mut bytes = xxh3_128(payload).to_le_bytes().to_vec();
+		bytes.extend_from_slice(payload);
+		let path = dir.path().join(name);
+		fs::write(&path, bytes).unwrap();
+		path
+	}
+
+	#[test]
+	fn full_server_round_trip() {
+		let remote_dir = TempDir::new().unwrap();
+		let cache_dir = TempDir::new().unwrap();
+
+		let payload = b"flowrider-full-server!";
+		let src_path = make_sample_file(&remote_dir, "sample.bin", payload);
+		let remote_url = Url::from_file_path(&src_path).unwrap();
+
+		// Relative path inside cache where we want the shard to end up.
+		let local_rel = "data/shard.bin";
+
+		// ────── Start Flowrider server in a background thread ─────
+		let socket_name = format!("flowrider-test-{}", rand::rng().random::<u64>());
+		let cache_dir_str = cache_dir.path().to_str().unwrap().to_owned();
+		let addr = StdSocketAddr::from_abstract_name(socket_name.as_bytes()).expect("abstract socket addr");
+
+		// Spawn and detach; the thread blocks forever, so we don’t join.
+		thread::spawn(move || {
+			// unlimited cache, at most 2 concurrent downloads, 2 worker threads
+			start_server(&socket_name, 0, 2, cache_dir_str, 2);
+		});
+
+		// ────── Client: send request via SocketConnection ─────────
+		let conn = SocketConnection::new(addr, 0);
+
+		// This waits until the server is ready internally.
+		let response = conn.send_message(remote_url.as_str(), local_rel, None, 0).expect("send_message should succeed");
+		assert_eq!(response, 1, "server must reply with byte 1");
+
+		// ────── Validate side-effects on disk ─────────────────────
+		let cached_path = cache_dir.path().join(local_rel);
+		assert!(cached_path.exists(), "shard should exist in cache after server response");
+
+		// The download path for file:// URLs is a symlink to the source.
+		let link_target = cached_path.read_link().expect("should be symlink");
+		assert_eq!(
+			link_target.canonicalize().unwrap(),
+			src_path.canonicalize().unwrap(),
+			"symlink should point at original source file"
+		);
+
+		// Sanity: read header back and confirm xxh3 hash matches payload.
+		let mut f = fs::File::open(&src_path).unwrap();
+		let mut hdr = [0u8; 16];
+		f.read_exact(&mut hdr).unwrap();
+		let expected = u128::from_le_bytes(hdr);
+		let got = xxhash_rust::xxh3::xxh3_128(payload);
+		assert_eq!(expected, got, "hash header should match payload");
+	}
+}

@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "flowrider"
 dynamic = ["version"]
-description = "High-performance PyTorch-compatible streaming dataset with distributed caching for on-the-fly remote shard fetching"
+description = "High-performance PyTorch-compatible streaming dataset with distributed caching for on-the-fly remote dataset fetching"
 readme = {file = "README.md", content-type = "text/markdown"}
 license = {text = "Apache-2.0"}
 authors = [{name = "fpgaminer", email = "fpgaminer@bitcoin-mining.com"}]

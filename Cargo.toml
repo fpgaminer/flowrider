@@ -3,6 +3,10 @@ name = "flowrider"
 version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
+description = "High-performance PyTorch-compatible streaming dataset with distributed caching for on-the-fly remote dataset fetching"
+homepage    = "https://github.com/fpgaminer/flowrider"
+repository  = "https://github.com/fpgaminer/flowrider"
+readme      = "README.md"
 
 [lib]
 name = "flowrider"

@@ -1,5 +1,4 @@
-use anyhow::{Context, ensure};
-use async_recursion::async_recursion;
+use anyhow::{Context, bail, ensure};
 use log::{info, warn};
 use moka::future::{Cache, FutureExt};
 use std::{
@@ -9,6 +8,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 use url::Url;
+use walkdir::WalkDir;
 
 
 pub struct ShardMeta {
@@ -60,50 +60,71 @@ impl ShardCache {
 		this
 	}
 
-	#[async_recursion]
 	async fn populate_cache(&self, path: &Path) {
-		if !path.exists() {
-			return;
-		}
-
-		let Ok(mut entries) = tokio::fs::read_dir(path).await.inspect_err(|e| {
-			warn!("Failed to read directory {}: {:?}", path.display(), e);
-		}) else {
-			return;
-		};
-
-		while let Some(entry) = match entries.next_entry().await {
-			Ok(e) => e,
+		let existing_files = match self.find_existing_cache_files(path) {
+			Ok(files) => files,
 			Err(e) => {
-				warn!("Failed to read entry in directory {}: {:?}", path.display(), e);
+				warn!(
+					"There was a problem finding existing files in the cache directory. To prevent accidental deletion of non-cache files, all existing files will be ignored. This could cause your cache size to explode. Cache directory: {}. Error: {:?}",
+					path.display(),
+					e
+				);
 				return;
 			},
-		} {
-			let path = entry.path();
-			if path.is_file() && path.extension().is_some_and(|ext| ext == "mds") {
-				let Ok(local_path) = path.canonicalize() else {
-					warn!("Failed to canonicalize path {:?}. Skipping.", path.display());
-					continue;
-				};
-				let Some(local) = local_path.to_str() else {
-					warn!("Path {} is not valid UTF-8. Skipping.", local_path.display());
-					continue;
-				};
+		};
 
-				let Ok(metadata) = tokio::fs::metadata(&path).await else {
-					warn!("Failed to get metadata for path {}. Skipping.", path.display());
-					continue;
-				};
+		for (local, meta) in existing_files {
+			self.cache.insert(local, meta).await;
+		}
+	}
 
-				let meta = Arc::new(ShardMeta {
+	fn find_existing_cache_files(&self, path: &Path) -> anyhow::Result<Vec<(String, Arc<ShardMeta>)>> {
+		let mut results = Vec::new();
+
+		for entry in WalkDir::new(path) {
+			let entry = entry.context("Failed to read directory entry")?;
+			let metadata = std::fs::metadata(entry.path()).with_context(|| format!("Failed to get metadata for path: {}", entry.path().display()))?;
+			let filename = entry
+				.file_name()
+				.to_str()
+				.ok_or_else(|| anyhow::anyhow!("File name {:?} is not valid UTF-8", entry.file_name()))?;
+
+			if metadata.is_dir() {
+				continue;
+			}
+
+			if !metadata.is_file() {
+				bail!("Path {:?} is not a file or directory", entry.path());
+			}
+
+			if filename == "index.json" {
+				// skip index files
+				continue;
+			}
+
+			// Ignore compression extensions
+			let filename = filename.trim_end_matches(".gz");
+
+			if !filename.ends_with(".bin") {
+				bail!("File {:?} does not have a valid extension", entry.path());
+			}
+
+			let path = entry
+				.into_path()
+				.into_os_string()
+				.into_string()
+				.map_err(|p| anyhow::anyhow!("Path {p:?} is not valid UTF-8"))?;
+
+			results.push((
+				path,
+				Arc::new(ShardMeta {
 					bytes: metadata.len().try_into().unwrap_or(u32::MAX),
 					remote: None,
-				});
-				self.cache.insert(local.to_string(), meta).await;
-			} else if path.is_dir() {
-				self.populate_cache(&path).await;
-			}
+				}),
+			));
 		}
+
+		Ok(results)
 	}
 
 	pub async fn get_shard(&self, remote: Url, local: &str, download_semaphore: &Semaphore) -> anyhow::Result<Arc<ShardMeta>> {
@@ -333,5 +354,39 @@ mod tests {
 		let exists_a = tokio::fs::try_exists(&shard_a_path).await.unwrap();
 		let exists_b = tokio::fs::try_exists(&shard_b_path).await.unwrap();
 		assert!(!(exists_a && exists_b), "both shard files are still present; eviction listener did not run");
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn populate_cache_discovers_existing_shards() {
+		use tokio::fs;
+
+		let tmpdir = tempfile::tempdir().expect("create tempdir");
+		let cache_root = tmpdir.path();
+
+		// shard 1: plain .bin at cache_root/shard_a.bin (1 234 bytes)
+		let shard1_path = cache_root.join("shard_a.bin");
+		fs::write(&shard1_path, vec![0_u8; 1_234]).await.unwrap();
+
+		// shard 2: compressed .bin.gz inside a sub-directory (456 bytes)
+		let shard2_path = cache_root.join("sub").join("shard_b.bin.gz");
+		fs::create_dir_all(shard2_path.parent().unwrap()).await.unwrap();
+		fs::write(&shard2_path, vec![0_u8; 456]).await.unwrap();
+
+		// an index.json
+		let idx_path = shard2_path.parent().unwrap().join("index.json");
+		fs::write(&idx_path, b"{}").await.unwrap();
+
+		let cache = ShardCache::new(0, cache_root.to_str().unwrap()).await;
+
+		let key1 = shard1_path.to_str().unwrap();
+		let key2 = shard2_path.to_str().unwrap();
+
+		// Check that existing shards were discovered and added to the cache.
+		let meta1 = cache.cache.get(key1).await;
+		let meta2 = cache.cache.get(key2).await;
+		assert!(meta1.is_some(), "plain .bin shard should be cached");
+		assert!(meta2.is_some(), ".bin.gz shard should be cached");
+		assert_eq!(meta1.unwrap().bytes, 1_234);
+		assert_eq!(meta2.unwrap().bytes, 456);
 	}
 }

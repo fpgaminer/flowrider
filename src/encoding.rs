@@ -382,11 +382,11 @@ pub fn decode_sample<'py, R: Read>(py: Python<'py>, mut reader: R, columns: &[(S
 
 #[cfg(test)]
 mod tests {
-	use crate::encoding::ColumnValue;
-
-	use super::ColumnEncoding;
-	use pyo3::prelude::*;
 	use std::io::Cursor;
+
+	use super::*;
+	use pyo3::prelude::*;
+	use tempfile::tempdir;
 
 	/// Helper: call `decode_to_python` and return the raw `PyAny`
 	fn decode<'py>(py: Python<'py>, enc: ColumnEncoding, bytes: Vec<u8>) -> Bound<'py, PyAny> {
@@ -449,7 +449,7 @@ mod tests {
 	numeric_test!(uint32_scalar, ColumnEncoding::Uint32, u32, 3_900_000_000);
 	numeric_test!(int64_scalar, ColumnEncoding::Int64, i64, -9_000_000_000);
 	numeric_test!(uint64_scalar, ColumnEncoding::Uint64, u64, 18_446_744_073_709_551_615u64);
-	numeric_test!(float32_scalar, ColumnEncoding::Float32, f32, -1_234.5678_f32);
+	numeric_test!(float32_scalar, ColumnEncoding::Float32, f32, -1_234.567_8_f32);
 	numeric_test!(float64_scalar, ColumnEncoding::Float64, f64, 8.901234567890123e55_f64);
 
 	#[test]
@@ -462,5 +462,160 @@ mod tests {
 			let res = ColumnEncoding::Int32.decode_to_python(py, Cursor::new(buf), &frombuffer);
 			assert!(res.is_err());
 		});
+	}
+
+	#[test]
+	fn sample_index_to_path_layout() {
+		// index          dir_A dir_B  filename
+		// 0x0102_03EA -> 0xEA   0x03   0x010203EA
+		let p = sample_index_to_path(0x0102_03EA, false);
+		assert_eq!(p, PathBuf::from("234").join("3").join("16909290.bin"));
+		let gz = sample_index_to_path(0x0102_03EA, true);
+		assert!(gz.ends_with("16909290.bin.gz"));
+	}
+
+	#[test]
+	fn float16_roundtrip() {
+		Python::with_gil(|py| {
+			// IEEE‑754 half‑precision 1.0  → 0x3c00 (little endian)
+			let half_1_0 = vec![0x00, 0x3c];
+			let np = py.import("numpy").unwrap();
+			let obj = ColumnEncoding::Float16
+				.decode_to_python(py, Cursor::new(half_1_0), &np.getattr("frombuffer").unwrap())
+				.unwrap();
+			let v: f32 = obj.call_method0("item").unwrap().extract().unwrap();
+			assert!((v - 1.0).abs() < 1e-3, "expected 1.0 from float16 decode");
+		});
+	}
+
+	macro_rules! encode_roundtrip {
+		($name:ident, $val:expr, $enc:ident, $ty:ty) => {
+			#[test]
+			fn $name() {
+				Python::with_gil(|py| {
+					let value: $ty = $val;
+
+					// encode ---------------------------------------------------
+					let mut buf = Vec::new();
+					ColumnValue::$enc(value).encode(&mut buf).unwrap();
+
+					// decode ---------------------------------------------------
+					let np = py.import("numpy").unwrap();
+					let frombuffer = np.getattr("frombuffer").unwrap();
+					let decoded = ColumnEncoding::$enc.decode_to_python(py, Cursor::new(buf), &frombuffer).unwrap();
+
+					// compare --------------------------------------------------
+					let round: $ty = decoded.call_method0("item").unwrap().extract().unwrap();
+					assert_eq!(round, value);
+				});
+			}
+		};
+	}
+
+	// Only numeric types require extra coverage (string/bytes handled elsewhere)
+	encode_roundtrip!(int8_cv, -8i8, Int8, i8);
+	encode_roundtrip!(uint8_cv, 250u8, Uint8, u8);
+	encode_roundtrip!(int16_cv, -12345i16, Int16, i16);
+	encode_roundtrip!(uint16_cv, 54321u16, Uint16, u16);
+	encode_roundtrip!(int32_cv, -2_000_000i32, Int32, i32);
+	encode_roundtrip!(uint32_cv, 3_900_000u32, Uint32, u32);
+	encode_roundtrip!(int64_cv, -9_876_543_210i64, Int64, i64);
+	encode_roundtrip!(uint64_cv, 12_345_678_901_234_567u64, Uint64, u64);
+	encode_roundtrip!(float32_cv, -std::f32::consts::PI, Float32, f32);
+	encode_roundtrip!(float64_cv, std::f64::consts::E, Float64, f64);
+
+	#[test]
+	fn decode_sample_mixed_columns() {
+		Python::with_gil(|py| {
+			let columns = vec![
+				("txt".to_owned(), ColumnEncoding::Str),
+				("num".to_owned(), ColumnEncoding::Int16),
+				("bin".to_owned(), ColumnEncoding::Bytes),
+				("flt".to_owned(), ColumnEncoding::Float32),
+			];
+
+			// build raw buffer via ColumnValue::encode
+			let mut buf = Vec::new();
+			ColumnValue::Str("hi".into()).encode(&mut buf).unwrap();
+			ColumnValue::Int16(-123).encode(&mut buf).unwrap();
+			ColumnValue::Bytes(vec![1, 2, 3]).encode(&mut buf).unwrap();
+			ColumnValue::Float32(0.5).encode(&mut buf).unwrap();
+
+			let sample = decode_sample(py, Cursor::new(buf), &columns).unwrap();
+
+			assert_eq!(sample.get_item("txt").unwrap().unwrap().extract::<&str>().unwrap(), "hi");
+			assert_eq!(
+				sample.get_item("num").unwrap().unwrap().call_method0("item").unwrap().extract::<i16>().unwrap(),
+				-123
+			);
+			assert_eq!(sample.get_item("bin").unwrap().unwrap().extract::<&[u8]>().unwrap(), &[1, 2, 3]);
+			assert!((sample.get_item("flt").unwrap().unwrap().call_method0("item").unwrap().extract::<f32>().unwrap() - 0.5).abs() < 1e-6);
+		});
+	}
+
+	fn exercise_sample_writer(compress: bool) {
+		Python::with_gil(|py| {
+			let tmp = tempdir().unwrap();
+			let mut cols = HashMap::new();
+			cols.insert("txt".into(), ColumnEncoding::Str);
+			cols.insert("num".into(), ColumnEncoding::Int32);
+
+			let mut writer = SampleWriter::new(tmp.path().into(), compress, cols.clone(), 2);
+
+			for n in 0..3 {
+				let d = PyDict::new(py);
+				d.set_item("txt", format!("row{n}")).unwrap();
+				d.set_item("num", n).unwrap();
+				writer.write(d).unwrap();
+			}
+			writer.finish().unwrap();
+
+			// index.json exists and matches
+			let idx: IndexJson = serde_json::from_str(&std::fs::read_to_string(tmp.path().join("index.json")).unwrap()).unwrap();
+			assert_eq!(idx.samples, 3);
+			assert_eq!(idx.compression.is_some(), compress);
+
+			// load first sample
+			let p = tmp.path().join(sample_index_to_path(0, compress));
+			let raw = std::fs::read(p).unwrap();
+			let payload = if compress {
+				use flate2::read::GzDecoder;
+				let mut dec = GzDecoder::new(&raw[16..]);
+				let mut out = Vec::new();
+				dec.read_to_end(&mut out).unwrap();
+				out
+			} else {
+				raw[16..].to_vec()
+			};
+
+			let cols_vec: Vec<_> = idx
+				.column_names
+				.iter()
+				.zip(idx.column_encodings.iter())
+				.map(|(name, enc)| (name.clone(), enc.clone()))
+				.collect();
+			let decoded = decode_sample(py, Cursor::new(payload), &cols_vec).unwrap();
+			assert_eq!(decoded.get_item("txt").unwrap().unwrap().extract::<&str>().unwrap(), "row0");
+			assert_eq!(
+				decoded
+					.get_item("num")
+					.unwrap()
+					.unwrap()
+					.call_method0("item")
+					.unwrap()
+					.extract::<i32>()
+					.unwrap(),
+				0
+			);
+		});
+	}
+
+	#[test]
+	fn sample_writer_plain() {
+		exercise_sample_writer(false);
+	}
+	#[test]
+	fn sample_writer_gzip() {
+		exercise_sample_writer(true);
 	}
 }

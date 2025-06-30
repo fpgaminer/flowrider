@@ -208,7 +208,7 @@ async fn s3_download<P: AsRef<Path>>(url: Url, tmp_path: P) -> anyhow::Result<()
 /// This is the main driver of the caching server.
 /// It handles requests for shards from clients, downloading them and reaping shards to keep the cache size below the limit.
 pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize, cache_dir: String) -> std::io::Result<()> {
-	let cache = ShardCache::new(cache_limit, &cache_dir).await;
+	let cache = ShardCache::new(cache_limit, cache_dir).await;
 	let download_semaphore = Arc::new(Semaphore::new(max_downloads));
 
 	// tokio doesn't directly support abstract namespace sockets yet, so we build a standard listener and then convert it to a tokio listener

@@ -11,6 +11,7 @@ use url::Url;
 use walkdir::WalkDir;
 
 
+#[derive(Debug)]
 pub struct ShardMeta {
 	bytes: u32,
 	remote: Option<Url>,
@@ -24,9 +25,7 @@ pub struct ShardCache {
 }
 
 impl ShardCache {
-	pub async fn new(cache_limit: u64, cache_dir: &str) -> ShardCache {
-		let cache_dir = PathBuf::from(cache_dir);
-
+	pub async fn new<P: Into<PathBuf>>(cache_limit: u64, cache_dir: P) -> ShardCache {
 		let mut cache = Cache::builder()
 			.weigher(|_: &String, meta: &Arc<ShardMeta>| meta.bytes)
 			.async_eviction_listener(|key, _meta, _cause| {
@@ -50,7 +49,10 @@ impl ShardCache {
 
 		let cache = cache.build();
 
-		let this = ShardCache { cache, cache_dir };
+		let this = ShardCache {
+			cache,
+			cache_dir: cache_dir.into(),
+		};
 
 		// find existing shards in the cache directory and pre-populate the cache
 		info!("Populating shard cache from {}", this.cache_dir.display());
@@ -269,6 +271,7 @@ async fn download_shard(remote: &Url, local: &str, download_semaphore: &Semaphor
 mod tests {
 	use super::*;
 	use std::time::Duration;
+	use tempfile::TempDir;
 	use tokio::time::sleep;
 
 	#[test]
@@ -314,10 +317,9 @@ mod tests {
 		// A tiny cache (1 KiB) and a temporary directory to act as the cache dir.
 		let cache_limit: u64 = 1024;
 		let tmpdir = tempfile::tempdir().expect("failed to create temp dir");
-		let cache_dir = tmpdir.path().to_str().unwrap();
 
 		// Build the cache (this also scans the directory, which is empty now).
-		let shard_cache = ShardCache::new(cache_limit, cache_dir).await;
+		let shard_cache = ShardCache::new(cache_limit, tmpdir.path()).await;
 
 		// Create two dummy shard files, each 800 bytes – together they exceed the limit.
 		let shard_a_path = tmpdir.path().join("shard_a.mds");
@@ -376,7 +378,7 @@ mod tests {
 		let idx_path = shard2_path.parent().unwrap().join("index.json");
 		fs::write(&idx_path, b"{}").await.unwrap();
 
-		let cache = ShardCache::new(0, cache_root.to_str().unwrap()).await;
+		let cache = ShardCache::new(0, cache_root).await;
 
 		let key1 = shard1_path.to_str().unwrap();
 		let key2 = shard2_path.to_str().unwrap();
@@ -388,5 +390,86 @@ mod tests {
 		assert!(meta2.is_some(), ".bin.gz shard should be cached");
 		assert_eq!(meta1.unwrap().bytes, 1_234);
 		assert_eq!(meta2.unwrap().bytes, 456);
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn get_shard_rejects_absolute_local_path() {
+		let tmp = TempDir::new().unwrap();
+		let cache = ShardCache::new(0, tmp.path()).await;
+		let sem = Semaphore::new(1);
+
+		// absolute path ⇒ is_local_path_valid() → ensure!() failure
+		let bad_local = "/definitely/not/relative.bin";
+		let remote = Url::parse("file:///tmp/whatever.bin").unwrap();
+
+		let err = cache.get_shard(remote, bad_local, &sem).await.expect_err("absolute paths must be rejected");
+		assert!(err.to_string().contains("Local path '/definitely/not/relative.bin' is not valid"));
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn get_shard_rejects_remote_in_cache_dir() {
+		let cache_root = TempDir::new().unwrap();
+		let cache = ShardCache::new(0, cache_root.path()).await;
+		let sem = Semaphore::new(1);
+
+		// remote file *inside* the cache directory
+		let remote_file = cache_root.path().join("same.bin");
+		// only the *directory* needs to exist for canonicalize(); file itself is optional
+		let remote_url = Url::from_file_path(&remote_file).unwrap();
+
+		let err = cache
+			.get_shard(remote_url, "same.bin", &sem)
+			.await
+			.expect_err("remote & local cache dir must not coincide");
+		assert!(err.to_string().contains("must not be the same as local cache path"));
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn get_shard_downloads_and_caches() {
+		// ─── Remote “dataset” ─────────────────────────────────────
+		let remote_dir = TempDir::new().unwrap();
+		let source_path = remote_dir.path().join("source.bin");
+
+		// minimal sample: 16-byte hash header + small payload
+		let payload = b"flowrider";
+		let mut file_bytes = xxhash_rust::xxh3::xxh3_128(payload).to_le_bytes().to_vec();
+		file_bytes.extend_from_slice(payload);
+		tokio::fs::write(&source_path, &file_bytes).await.unwrap();
+
+		let remote_url = Url::from_file_path(&source_path).unwrap();
+
+		// ─── Empty cache ──────────────────────────────────────────
+		let cache_root = TempDir::new().unwrap();
+		let cache = ShardCache::new(0, cache_root.path().to_str().unwrap()).await;
+		let sem = Semaphore::new(2);
+
+		// ─── First call triggers download (symlink) ──────────────
+		let meta = cache
+			.get_shard(remote_url.clone(), "folder/target.bin", &sem)
+			.await
+			.expect("download should succeed");
+
+		assert_eq!(meta.bytes as usize, file_bytes.len());
+		assert_eq!(meta.remote.as_ref().unwrap(), &remote_url);
+
+		// File really exists inside cache and points to remote:
+		let cached_path = cache_root.path().join("folder/target.bin");
+		assert!(tokio::fs::try_exists(&cached_path).await.unwrap());
+		assert!(cached_path.read_link().is_ok(), "download created a symlink");
+
+		// ─── Second call must be a pure cache-hit (no download) ──
+		let meta2 = cache.get_shard(remote_url.clone(), "folder/target.bin", &sem).await.expect("cache hit");
+		assert!(Arc::ptr_eq(&meta, &meta2), "should return the same Arc");
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn find_existing_cache_rejects_bad_extension() {
+		let tmp = TempDir::new().unwrap();
+		// create a bogus file the scanner should dislike
+		tokio::fs::write(tmp.path().join("not_a_shard.txt"), b"bad").await.unwrap();
+
+		let cache = ShardCache::new(0, tmp.path().to_str().unwrap()).await;
+		let err = cache.find_existing_cache_files(tmp.path()).expect_err("non-.bin/.bin.gz files must error");
+		assert!(err.to_string().contains("does not have a valid extension"));
 	}
 }

@@ -59,7 +59,6 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, semaphore: &
 
 	// If the file already exists, we can skip downloading it
 	if tokio::fs::try_exists(dest_path).await.unwrap_or(false) {
-		// If the file already exists, we can skip downloading it
 		return Ok(());
 	}
 
@@ -107,11 +106,20 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, semaphore: &
 				))?;
 			},
 			"s3" => {
-				if let Err(err) = s3_download(url.clone(), &tmp_path).await {
-					// If the download fails, we log the error and continue to retry
-					warn!("Failed to download S3 object: {url}. Will retry. Error: {err:?}");
-					tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-					continue;
+				// TODO: Configurable timeout
+				let download_future = s3_download(url.clone(), &tmp_path);
+				match tokio::time::timeout(std::time::Duration::from_secs(60), download_future).await {
+					Ok(Ok(())) => {},
+					Ok(Err(e)) => {
+						warn!("Failed to download S3 object: {url}. Will retry. Error: {e:?}");
+						tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+						continue;
+					},
+					Err(_) => {
+						warn!("S3 download timed out for {url}. Will retry.");
+						tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+						continue;
+					},
 				}
 			},
 			_ => bail!("Unsupported URL scheme: {}", url.scheme()),

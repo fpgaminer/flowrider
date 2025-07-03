@@ -83,6 +83,10 @@ impl ShardCache {
 	fn find_existing_cache_files(&self, path: &Path) -> anyhow::Result<Vec<(String, Arc<ShardMeta>)>> {
 		let mut results = Vec::new();
 
+		if !path.exists() {
+			return Ok(results);
+		}
+
 		for entry in WalkDir::new(path) {
 			let entry = entry.context("Failed to read directory entry")?;
 			let metadata = std::fs::metadata(entry.path()).with_context(|| format!("Failed to get metadata for path: {}", entry.path().display()))?;

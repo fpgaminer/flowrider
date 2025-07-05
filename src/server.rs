@@ -1,6 +1,5 @@
 use anyhow::{Context, bail, ensure};
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use log::{error, info, warn};
 use pyo3::{Python, sync::MutexExt};
 use rand::distr::SampleString;
 use s3::Bucket;
@@ -11,7 +10,7 @@ use std::{
 		linux::net::SocketAddrExt,
 		unix::net::{SocketAddr as StdSocketAddr, UnixListener as StdUnixListener, UnixStream as StdUnixStream},
 	},
-	path::Path,
+	path::{Path, PathBuf},
 	sync::Arc,
 };
 use tempfile::TempPath;
@@ -22,12 +21,17 @@ use tokio::{
 	runtime,
 	sync::Semaphore,
 };
+use tracing::Instrument;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
 use url::Url;
 
 use crate::{OptionPythonExt, cache::ShardCache, std_sleep_allow_threads};
 
 
-pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, cache_dir: String, worker_threads: usize) {
+pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, cache_dir: String, worker_threads: usize, trace_path: Option<PathBuf>) {
+	let tracing_guard = init_tracing(trace_path.as_deref());
+
 	let socket_addr =
 		StdSocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap_or_else(|_| panic!("Failed to create abstract socket address: {socket_name}"));
 
@@ -37,12 +41,52 @@ pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, c
 		.build()
 		.expect("Failed to build Tokio runtime");
 
-	info!("Starting Flowrider cache server...");
+	tracing::info!("Starting Flowrider cache server...");
 	rt.block_on(async {
 		if let Err(e) = server(socket_addr, cache_limit, max_downloads, cache_dir).await {
-			error!("Error in server: {e}");
+			tracing::error!(?e, "Error in server");
 		}
 	});
+
+	if let Some(guard) = tracing_guard {
+		tracing::info!("Shutting down tracing");
+		drop(guard); // Explicitly drop the guard to flush logs
+	}
+}
+
+
+/// Initializes tracing with optional file logging.
+/// The returned guard should be held onto until the end of the program to ensure all logs are flushed.
+fn init_tracing(file_path: Option<&Path>) -> Option<WorkerGuard> {
+	let stderr_layer = tracing_subscriber::fmt::layer()
+		.pretty()
+		.with_writer(std::io::stderr)
+		.with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+		.with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+
+	let (file_layer, guard) = if let Some(file_path) = file_path {
+		let file_appender = tracing_appender::rolling::never(file_path.parent().unwrap_or_else(|| Path::new(".")), file_path.file_name().unwrap());
+		let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+
+		let file_layer = tracing_subscriber::fmt::layer()
+			.with_writer(file_writer)
+			.with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+			.with_span_events(FmtSpan::CLOSE)
+			.with_ansi(false)
+			.with_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")));
+
+		(Some(file_layer), Some(guard))
+	} else {
+		(None, None)
+	};
+
+	tracing_subscriber::registry().with(stderr_layer).with(file_layer).init();
+
+	if let Some(file_path) = file_path {
+		tracing::info!("Tracing to {}", file_path.display());
+	}
+
+	guard
 }
 
 
@@ -62,7 +106,7 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, semaphore: &
 		return Ok(());
 	}
 
-	info!("Downloading file from {} to {}", url, dest_path.display());
+	tracing::info!(%url, dest_path=%dest_path.display(), "Downloading file");
 
 	// create destination directory if it doesn't exist
 	fs::create_dir_all(dest_parent)
@@ -111,12 +155,12 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, semaphore: &
 				match tokio::time::timeout(std::time::Duration::from_secs(60), download_future).await {
 					Ok(Ok(())) => {},
 					Ok(Err(e)) => {
-						warn!("Failed to download S3 object: {url}. Will retry. Error: {e:?}");
+						tracing::warn!(%url, ?e, "Failed to download S3 object. Will retry.");
 						tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 						continue;
 					},
 					Err(_) => {
-						warn!("S3 download timed out for {url}. Will retry.");
+						tracing::warn!(%url, "S3 download timed out. Will retry.");
 						tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 						continue;
 					},
@@ -150,9 +194,9 @@ pub async fn download_file<P: AsRef<Path>>(url: &Url, dest_path: P, semaphore: &
 
 			let hash = hasher.digest128();
 			if hash != expected_hash {
-				warn!(
-					"Hash mismatch for downloaded file {}. Expected: {:032x}, got: {:032x}. Will retry download.",
-					tmp_path.display(),
+				tracing::warn!(
+					tmp_path = %tmp_path.display(),
+					"Hash mismatch for downloaded file. Expected: {:032x}, got: {:032x}. Will retry download.",
 					expected_hash,
 					hash
 				);
@@ -175,12 +219,7 @@ async fn s3_download<P: AsRef<Path>>(url: Url, tmp_path: P) -> anyhow::Result<()
 	let endpoint_url = env::var("S3_ENDPOINT_URL").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 	let credentials = s3::creds::Credentials::default().context("Failed to get S3 credentials")?;
 
-	info!(
-		"Downloading S3 object, endpoint: {}, bucket: {}, key: {}",
-		endpoint_url,
-		url.host_str().unwrap_or(""),
-		url.path()
-	);
+	tracing::info!(endpoint_url, bucket = url.host_str().unwrap_or(""), key = url.path(), "Downloading S3 object",);
 
 	// Create the S3 bucket client
 	let bucket_name = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URL: {}", url))?;
@@ -223,7 +262,7 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 	let std_listener = StdUnixListener::bind_addr(&addr)?;
 	std_listener.set_nonblocking(true)?;
 	let listener = UnixListener::from_std(std_listener)?;
-	info!("Flowrider Server listening on {addr:?}");
+	tracing::info!("Flowrider Server listening on {addr:?}");
 
 	loop {
 		let (mut stream, _) = listener.accept().await?;
@@ -234,20 +273,26 @@ pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize,
 			let client_ranks = match stream.read_u32_le().await {
 				Ok(rank) => rank,
 				Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-					warn!("Client disconnected before sending rank");
+					tracing::warn!("Client disconnected before sending rank");
 					return;
 				},
 				Err(e) => {
-					error!("Failed to read client rank: {e:?}");
+					tracing::error!(?e, "Failed to read client rank");
 					return;
 				},
 			};
 			let client_rank = client_ranks >> 16;
-			let client_worker_id = client_rank & 0xFFFF;
+			let client_worker_id = client_ranks & 0xFFFF;
+			tracing::info!(client_rank, client_worker_id, "Accepted connection from client");
+			let span = tracing::info_span!("client", rank = client_rank, worker = client_worker_id);
 
-			if let Err(e) = handle_connection(stream, cache, download_semaphore).await {
-				error!("an error occurred while handling connection from rank={client_rank},worker={client_worker_id}: {e:?}");
+			async move {
+				if let Err(e) = handle_connection(stream, cache, download_semaphore).await {
+					tracing::error!(?e, "connection error");
+				}
 			}
+			.instrument(span)
+			.await;
 		});
 	}
 }
@@ -279,7 +324,6 @@ async fn handle_connection(mut stream: UnixStream, cache: ShardCache, download_s
 		let mut cursor = std::io::Cursor::new(&buf);
 		let remote = read_string(&mut cursor).context("Failed to read remote URI")?;
 		let local = read_string(&mut cursor).context("Failed to read local path")?;
-		info!("Received request for {remote} -> {local})");
 
 		// parse remote URI
 		let remote_uri = Url::parse(&remote).context(format!("Failed to parse remote URI: {remote}"))?;
@@ -319,9 +363,13 @@ pub struct SocketConnection {
 
 fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16, py: Option<Python<'py>>) -> anyhow::Result<StdUnixStream> {
 	let ranks = (global_rank as u32) << 16 | (worker_id as u32);
+	let mut retries = 0;
+
+	log::trace!("Connecting to Flowrider server at {addr:?} with global_rank: {global_rank}, worker_id: {worker_id}");
 
 	loop {
 		py.check_signals()?;
+		retries += 1;
 
 		match py.allow_threads(|| StdUnixStream::connect_addr(addr)) {
 			Ok(mut stream) => {
@@ -331,7 +379,7 @@ fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16
 
 				// introduce ourselves to the server
 				if let Err(e) = py.allow_threads(|| stream.write_u32::<byteorder::LittleEndian>(ranks)) {
-					warn!("Failed to send ranks to server (will retry): {e:?}");
+					log::warn!("Failed to send ranks to server (will retry): {e:?}");
 					std_sleep_allow_threads(std::time::Duration::from_millis(1000), py);
 					continue;
 				}
@@ -343,7 +391,10 @@ fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16
 				std_sleep_allow_threads(std::time::Duration::from_millis(100), py);
 			},
 			Err(e) => {
-				warn!("Failed to connect to socket at {addr:?} (will retry): {e:?}");
+				// The server takes a little while to start up, so ignore the first few connection errors.
+				if retries > 4 {
+					log::warn!("Failed to connect to socket at {addr:?} (will retry): {e:?}");
+				}
 				std_sleep_allow_threads(std::time::Duration::from_millis(1000), py);
 			},
 		}
@@ -411,7 +462,7 @@ impl SocketConnection {
 			py.check_signals()?;
 
 			if start.elapsed() > std::time::Duration::from_secs(60) && !time_warning_issued {
-				warn!("Waiting for response from server took longer than 60 seconds. This may indicate a problem with the server.");
+				log::warn!("Waiting for response from server took longer than 60 seconds. This may indicate a problem with the server.");
 				time_warning_issued = true;
 			}
 
@@ -511,7 +562,7 @@ mod tests {
 		// Spawn and detach; the thread blocks forever, so we don’t join.
 		thread::spawn(move || {
 			// unlimited cache, at most 2 concurrent downloads, 2 worker threads
-			start_server(&socket_name, 0, 2, cache_dir_str, 2);
+			start_server(&socket_name, 0, 2, cache_dir_str, 2, None);
 		});
 
 		// ────── Client: send request via SocketConnection ─────────

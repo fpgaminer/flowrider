@@ -41,3 +41,9 @@ Source = "https://github.com/fpgaminer/flowrider"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "python"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.format]
+indent-style = "tab"

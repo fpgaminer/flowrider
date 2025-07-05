@@ -1,12 +1,11 @@
 use anyhow::{Context, bail, ensure};
-use log::{info, warn};
 use moka::future::{Cache, FutureExt};
 use std::{
 	path::{Path, PathBuf},
 	sync::Arc,
-	time::Instant,
 };
 use tokio::sync::Semaphore;
+use tracing::instrument;
 use url::Url;
 use walkdir::WalkDir;
 
@@ -36,9 +35,9 @@ impl ShardCache {
 					}
 
 					if let Err(err) = tokio::fs::remove_file(Path::new(&*key)).await {
-						warn!("Cache failed to remove file {key}: {err:?}");
+						tracing::warn!(%key, ?err, "Cache failed to remove file");
 					}
-					info!("Cache removed file {key}");
+					tracing::info!(%key, "Cache removed file");
 				}
 				.boxed()
 			});
@@ -55,9 +54,9 @@ impl ShardCache {
 		};
 
 		// find existing shards in the cache directory and pre-populate the cache
-		info!("Populating shard cache from {}", this.cache_dir.display());
+		tracing::info!("Populating shard cache from {}", this.cache_dir.display());
 		this.populate_cache(&this.cache_dir).await;
-		info!("Shard cache populated");
+		tracing::info!("Shard cache populated");
 
 		this
 	}
@@ -66,10 +65,10 @@ impl ShardCache {
 		let existing_files = match self.find_existing_cache_files(path) {
 			Ok(files) => files,
 			Err(e) => {
-				warn!(
-					"There was a problem finding existing files in the cache directory. To prevent accidental deletion of non-cache files, all existing files will be ignored. This could cause your cache size to explode. Cache directory: {}. Error: {:?}",
-					path.display(),
-					e
+				tracing::warn!(
+					?e,
+					path = %path.display(),
+					"There was a problem finding existing files in the cache directory. To prevent accidental deletion of non-cache files, all existing files will be ignored. This could cause your cache size to explode.",
 				);
 				return;
 			},
@@ -103,8 +102,8 @@ impl ShardCache {
 				bail!("Path {:?} is not a file or directory", entry.path());
 			}
 
-			if filename == "index.json" {
-				// skip index files
+			if filename == "index.json" || filename.ends_with(".tmp") {
+				// skip index files and temporary files
 				continue;
 			}
 
@@ -133,6 +132,11 @@ impl ShardCache {
 		Ok(results)
 	}
 
+	#[instrument(
+		level = "info",
+		skip(download_semaphore, self),
+		fields(remote = %remote)
+	)]
 	pub async fn get_shard(&self, remote: Url, local: &str, download_semaphore: &Semaphore) -> anyhow::Result<Arc<ShardMeta>> {
 		// local path must be valid
 		// since local paths cannot have traversal components, we guarantee they can be used as unique keys in the cache
@@ -200,7 +204,6 @@ impl ShardCache {
 						remote
 					);
 				}
-				info!("Using cached shard at {local}");
 				Ok(meta)
 			},
 			Err(e) => Err(anyhow::anyhow!("Failed to get shard {}: {:?}", local, e)),
@@ -249,8 +252,8 @@ fn is_local_path_valid(path: &str) -> bool {
 }
 
 
+#[instrument(level = "info", skip(download_semaphore, remote, local))]
 async fn download_shard(remote: &Url, local: &str, download_semaphore: &Semaphore) -> anyhow::Result<Arc<ShardMeta>> {
-	let start = Instant::now();
 	crate::server::download_file(remote, local, download_semaphore).await?;
 
 	let bytes = tokio::fs::metadata(local)
@@ -263,9 +266,6 @@ async fn download_shard(remote: &Url, local: &str, download_semaphore: &Semaphor
 		bytes,
 		remote: Some(remote.clone()),
 	});
-
-	let elapsed = start.elapsed();
-	info!("Downloaded file {local} in {elapsed:?}");
 
 	Ok(meta)
 }

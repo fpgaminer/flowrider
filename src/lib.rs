@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use log::{error, info};
+use log::{error, info, trace};
 use pyo3::{
 	exceptions::{PyIOError, PyValueError},
 	marker::Ungil,
@@ -101,7 +101,7 @@ impl Config {
 	/// Note: This function will start the background cache server if it is not already running.  The cache server will only be started once per node.  It runs as a background thread of one of the processes on this local node.
 	/// If the process running the cache server gets forked (which is the default for PyTorch dataloader workers), the fact that the cache server is in a different thread ensures it does not survive to the child processes (which is good, because it has non-fork safe state).
 	#[new]
-	#[pyo3(signature = (cache_dir, cache_limit=0, max_downloads=8, readahead=6, num_cache_workers=None, local_rank=None, global_rank=None, world_size=None, master_addr=None, master_port=None))]
+	#[pyo3(signature = (cache_dir, cache_limit=0, max_downloads=8, readahead=6, num_cache_workers=None, local_rank=None, global_rank=None, world_size=None, master_addr=None, master_port=None, trace_path=None))]
 	#[allow(clippy::too_many_arguments)]
 	fn new(
 		cache_dir: &str,
@@ -114,6 +114,7 @@ impl Config {
 		world_size: Option<u32>,
 		master_addr: Option<&str>,
 		master_port: Option<u16>,
+		trace_path: Option<&str>,
 	) -> PyResult<Self> {
 		let num_cache_workers = num_cache_workers.unwrap_or(DEFAULT_NUM_CACHE_WORKERS);
 		let local_rank = local_rank
@@ -125,6 +126,10 @@ impl Config {
 			.unwrap_or(1);
 		let master_addr = master_addr.map(String::from).or_else(|| env::var("MASTER_ADDR").ok());
 		let master_port = master_port.or_else(|| env::var("MASTER_PORT").ok().and_then(|s| s.parse::<u16>().ok()));
+		let trace_path = trace_path
+			.map(String::from)
+			.or_else(|| env::var("FLOWRIDER_TRACE_PATH").ok())
+			.map(PathBuf::from);
 
 		if world_size == 0 {
 			return Err(PyValueError::new_err("world_size cannot be 0"));
@@ -181,7 +186,7 @@ impl Config {
 				let socket_name = socket_name.clone();
 				thread::spawn(move || {
 					// This will block until the server is stopped.
-					start_server(&socket_name, cache_limit, max_downloads, cache_dir_clone, num_cache_workers);
+					start_server(&socket_name, cache_limit, max_downloads, cache_dir_clone, num_cache_workers, trace_path);
 
 					// Ensure we hang onto the server config file until the server stops, at which point it will be dropped and thus deleted.
 					drop(server_config_path);
@@ -350,9 +355,9 @@ impl StreamingDataset {
 			.sample_paths(offset)
 			.map_err(|e| PyValueError::new_err(format!("Failed to get sample paths: {e:?}")))?;
 
-		info!(
-			"[{}] Getting sample {} from stream {} ({} samples), offset {}",
-			self.config.local_rank, index.0, stream_index.0, stream.n_samples, offset.0,
+		trace!(
+			"[{},{}] Getting sample {} from stream {} ({} samples), offset {}",
+			self.config.local_rank, worker_id, index.0, stream_index.0, stream.n_samples, offset.0,
 		);
 
 		// ask the cache server to make the sample available
@@ -550,7 +555,7 @@ fn dataset_readahead(iter: Arc<DatasetIteratorInner>, dataset: Arc<StreamRanges>
 			},
 		};
 
-		info!("[worker={}] readahead {}", worker_id, stream.local);
+		trace!("[worker={}] readahead {}", worker_id, stream.local);
 
 		if let Err(err) = conn.send_message(stream_remote.as_str(), &stream_local, None, worker_id) {
 			error!("[worker={worker_id}] Failed to send message to cache server for readahead: {err:?}");
@@ -805,7 +810,7 @@ fn get_work(
 	micro_batch_size: usize,
 	resume: Option<u64>,
 ) -> Vec<i64> {
-	info!(
+	trace!(
 		"[{global_rank}-{worker_id}] Getting work for epoch {epoch} with seed {seed:?}, shuffle: {shuffle}, drop_last: {drop_last}, micro_batch_size: {micro_batch_size}",
 	);
 	let global_rank = global_rank as usize;
@@ -900,7 +905,7 @@ fn get_work(
 		.cloned()
 		.collect::<Vec<_>>();
 
-	info!("[{global_rank}-{worker_id}] Work for epoch {epoch}: {ids:?}");
+	trace!("[{global_rank}-{worker_id}] Work for epoch {epoch}: {ids:?}");
 
 	ids
 }

@@ -1,4 +1,5 @@
 use anyhow::{Context, bail, ensure};
+use ignore::WalkBuilder;
 use moka::future::{Cache, FutureExt};
 use std::{
 	path::{Path, PathBuf},
@@ -7,7 +8,6 @@ use std::{
 use tokio::sync::Semaphore;
 use tracing::instrument;
 use url::Url;
-use walkdir::WalkDir;
 
 
 #[derive(Debug)]
@@ -80,13 +80,15 @@ impl ShardCache {
 	}
 
 	fn find_existing_cache_files(&self, path: &Path) -> anyhow::Result<Vec<(String, Arc<ShardMeta>)>> {
-		let mut results = Vec::new();
-
 		if !path.exists() {
-			return Ok(results);
+			return Ok(Vec::new());
 		}
 
-		for entry in WalkDir::new(path) {
+		// Called for each directory entry in the cache directory.
+		// Returns None to ignore directories, index files, and temporary files.
+		// Returns Some((path, meta)) for valid shard files.
+		// If an error occurs, it will be returned as an Err variant.
+		fn visit_path(entry: Result<ignore::DirEntry, ignore::Error>) -> anyhow::Result<Option<(String, Arc<ShardMeta>)>> {
 			let entry = entry.context("Failed to read directory entry")?;
 			let metadata = std::fs::metadata(entry.path()).with_context(|| format!("Failed to get metadata for path: {}", entry.path().display()))?;
 			let filename = entry
@@ -95,7 +97,7 @@ impl ShardCache {
 				.ok_or_else(|| anyhow::anyhow!("File name {:?} is not valid UTF-8", entry.file_name()))?;
 
 			if metadata.is_dir() {
-				continue;
+				return Ok(None);
 			}
 
 			if !metadata.is_file() {
@@ -104,7 +106,7 @@ impl ShardCache {
 
 			if filename == "index.json" || filename.ends_with(".tmp") {
 				// skip index files and temporary files
-				continue;
+				return Ok(None);
 			}
 
 			// Ignore compression extensions
@@ -120,16 +122,53 @@ impl ShardCache {
 				.into_string()
 				.map_err(|p| anyhow::anyhow!("Path {p:?} is not valid UTF-8"))?;
 
-			results.push((
+			Ok(Some((
 				path,
 				Arc::new(ShardMeta {
 					bytes: metadata.len().try_into().unwrap_or(u32::MAX),
 					remote: None,
 				}),
-			));
+			)))
 		}
 
-		Ok(results)
+		// Processes the results, returning immediately on any error.
+		let (tx, rx) = std::sync::mpsc::channel();
+		let result_thread = std::thread::spawn(move || {
+			let mut results = Vec::new();
+			for result in rx {
+				match result {
+					Ok((path, meta)) => {
+						results.push((path, meta));
+					},
+					Err(e) => return Err(e),
+				}
+			}
+
+			Ok(results)
+		});
+
+		// Use ignore crate to walk the directory tree using multiple threads.
+		// Quits immediately on any error, otherwise results will be collected in the result thread.
+		let walker = WalkBuilder::new(path).follow_links(false).standard_filters(false).build_parallel();
+		walker.run(|| {
+			Box::new(|entry| match visit_path(entry) {
+				Ok(Some((path, meta))) => {
+					tx.send(Ok((path, meta))).unwrap();
+					ignore::WalkState::Continue
+				},
+				Ok(None) => ignore::WalkState::Continue,
+				Err(e) => {
+					tx.send(Err(e)).unwrap();
+					ignore::WalkState::Quit
+				},
+			})
+		});
+		drop(tx); // Close the channel to signal the result thread that no more results will be sent.
+
+		match result_thread.join() {
+			Ok(results) => results,
+			Err(e) => Err(anyhow::anyhow!("Failed to join result thread: {:?}", e)),
+		}
 	}
 
 	#[instrument(

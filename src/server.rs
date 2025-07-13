@@ -6,9 +6,9 @@ use s3::Bucket;
 use std::{
 	env,
 	io::Write,
-	os::{
-		linux::net::SocketAddrExt,
-		unix::net::{SocketAddr as StdSocketAddr, UnixListener as StdUnixListener, UnixStream as StdUnixStream},
+	os::unix::{
+		ffi::OsStrExt,
+		net::{SocketAddr as StdSocketAddr, UnixListener as StdUnixListener, UnixStream as StdUnixStream},
 	},
 	path::{Path, PathBuf},
 	sync::Arc,
@@ -25,15 +25,13 @@ use tracing::Instrument;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
 use url::Url;
+use xxhash_rust::xxh3::xxh3_128;
 
 use crate::{OptionPythonExt, cache::ShardCache, std_sleep_allow_threads};
 
 
-pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, cache_dir: String, worker_threads: usize, trace_path: Option<PathBuf>) {
+pub fn start_server(listener: StdUnixListener, cache_limit: u64, max_downloads: usize, cache_dir: String, worker_threads: usize, trace_path: Option<PathBuf>) {
 	let tracing_guard = init_tracing(trace_path.as_deref());
-
-	let socket_addr =
-		StdSocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap_or_else(|_| panic!("Failed to create abstract socket address: {socket_name}"));
 
 	let rt = runtime::Builder::new_multi_thread()
 		.worker_threads(worker_threads)
@@ -43,7 +41,7 @@ pub fn start_server(socket_name: &str, cache_limit: u64, max_downloads: usize, c
 
 	tracing::info!("Starting Flowrider cache server...");
 	rt.block_on(async {
-		if let Err(e) = server(socket_addr, cache_limit, max_downloads, cache_dir).await {
+		if let Err(e) = server(listener, cache_limit, max_downloads, cache_dir).await {
 			tracing::error!(?e, "Error in server");
 		}
 	});
@@ -254,35 +252,46 @@ async fn s3_download<P: AsRef<Path>>(url: Url, tmp_path: P) -> anyhow::Result<()
 
 /// This is the main driver of the caching server.
 /// It handles requests for shards from clients, downloading them and reaping shards to keep the cache size below the limit.
-pub async fn server(addr: StdSocketAddr, cache_limit: u64, max_downloads: usize, cache_dir: String) -> std::io::Result<()> {
+pub async fn server(std_listener: StdUnixListener, cache_limit: u64, max_downloads: usize, cache_dir: String) -> std::io::Result<()> {
+	let cache_dir_hash = xxh3_128(cache_dir.as_bytes()).to_le_bytes();
 	let cache = ShardCache::new(cache_limit, cache_dir).await;
 	let download_semaphore = Arc::new(Semaphore::new(max_downloads));
 
-	// tokio doesn't directly support abstract namespace sockets yet, so we build a standard listener and then convert it to a tokio listener
-	let std_listener = StdUnixListener::bind_addr(&addr)?;
+	// convert std listener to tokio listener
 	std_listener.set_nonblocking(true)?;
 	let listener = UnixListener::from_std(std_listener)?;
-	tracing::info!("Flowrider Server listening on {addr:?}");
 
 	loop {
 		let (mut stream, _) = listener.accept().await?;
 		let cache = cache.clone();
 		let download_semaphore = download_semaphore.clone();
 		tokio::spawn(async move {
-			// The first content from the client is its rank
-			let client_ranks = match stream.read_u32_le().await {
-				Ok(rank) => rank,
+			// The first content from the client is its introduction message, which contains the client rank, worker ID, and cache directory hash.
+			let mut buf = [0u8; 20]; // 4 bytes for rank, 16 bytes for cache directory hash
+			match stream.read_exact(&mut buf).await {
+				Ok(_) => {},
 				Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-					tracing::warn!("Client disconnected before sending rank");
+					tracing::warn!("Client disconnected before sending introduction message");
 					return;
 				},
 				Err(e) => {
-					tracing::error!(?e, "Failed to read client rank");
+					tracing::error!(?e, "Failed to read introduction message from client");
 					return;
 				},
-			};
-			let client_rank = client_ranks >> 16;
-			let client_worker_id = client_ranks & 0xFFFF;
+			}
+			let client_rank = u16::from_le_bytes(buf[0..2].try_into().unwrap());
+			let client_worker_id = u16::from_le_bytes(buf[2..4].try_into().unwrap());
+			let client_cache_dir_hash = &buf[4..20];
+
+			if client_cache_dir_hash != cache_dir_hash {
+				tracing::warn!(
+					client_rank,
+					client_worker_id,
+					"Client cache directory hash does not match server's cache directory hash"
+				);
+				return;
+			}
+
 			tracing::info!(client_rank, client_worker_id, "Accepted connection from client");
 			let span = tracing::info_span!("client", rank = client_rank, worker = client_worker_id);
 
@@ -361,9 +370,19 @@ pub struct SocketConnection {
 	inner: std::sync::Mutex<Option<(StdUnixStream, u32)>>, // (stream, pid); Process ID of the process that created the connection. Used to detect forks.
 }
 
-fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16, py: Option<Python<'py>>) -> anyhow::Result<StdUnixStream> {
+fn connect_to_server<'py, P: AsRef<Path>>(
+	addr: &StdSocketAddr,
+	global_rank: u16,
+	worker_id: u16,
+	cache_dir: P,
+	py: Option<Python<'py>>,
+) -> anyhow::Result<StdUnixStream> {
 	let ranks = (global_rank as u32) << 16 | (worker_id as u32);
+	let cache_dir_hash = xxh3_128(cache_dir.as_ref().as_os_str().as_bytes()).to_le_bytes();
+	let mut introduction_message = Vec::with_capacity(4 + 16);
 	let mut retries = 0;
+	WriteBytesExt::write_u32::<byteorder::LittleEndian>(&mut introduction_message, ranks).unwrap();
+	introduction_message.extend_from_slice(&cache_dir_hash);
 
 	log::trace!("Connecting to Flowrider server at {addr:?} with global_rank: {global_rank}, worker_id: {worker_id}");
 
@@ -378,7 +397,7 @@ fn connect_to_server<'py>(addr: &StdSocketAddr, global_rank: u16, worker_id: u16
 					.map_err(|e| anyhow::anyhow!("Failed to set read timeout: {}", e))?;
 
 				// introduce ourselves to the server
-				if let Err(e) = py.allow_threads(|| stream.write_u32::<byteorder::LittleEndian>(ranks)) {
+				if let Err(e) = py.allow_threads(|| stream.write_all(&introduction_message)) {
 					log::warn!("Failed to send ranks to server (will retry): {e:?}");
 					std_sleep_allow_threads(std::time::Duration::from_millis(1000), py);
 					continue;
@@ -415,7 +434,14 @@ impl SocketConnection {
 	/// `remote_uri` must fit in a u16, so it must be less than 65536 bytes.
 	/// `local_path` must also fit in a u16, so it must be less than 65536 bytes.
 	/// The server is always expected to respond with 1.
-	pub fn send_message<'py>(&self, remote_uri: &str, local_path: &str, py: Option<Python<'py>>, worker_id: u16) -> anyhow::Result<u8> {
+	pub fn send_message<'py, P: AsRef<Path>>(
+		&self,
+		remote_uri: &str,
+		local_path: &str,
+		py: Option<Python<'py>>,
+		worker_id: u16,
+		cache_dir: P,
+	) -> anyhow::Result<u8> {
 		// Prevent concurrent usage.
 		let mut guard = if let Some(py) = py {
 			self.inner.lock_py_attached(py)
@@ -446,7 +472,7 @@ impl SocketConnection {
 		let (mut stream, pid) = match guard.take() {
 			Some((stream, pid)) if pid == std::process::id() => (stream, pid), // Reuse existing connection if PID matches.
 			_ => {
-				let stream = connect_to_server(&self.addr, self.global_rank, worker_id, py).context("Failed to connect to server")?;
+				let stream = connect_to_server(&self.addr, self.global_rank, worker_id, cache_dir, py).context("Failed to connect to server")?;
 				(stream, std::process::id())
 			},
 		};
@@ -497,7 +523,10 @@ mod tests {
 	use std::{
 		fs,
 		io::{Cursor, Read},
-		os::{linux::net::SocketAddrExt, unix::net::SocketAddr as StdSocketAddr},
+		os::{
+			linux::net::SocketAddrExt,
+			unix::net::{SocketAddr as StdSocketAddr, UnixListener as StdUnixListener},
+		},
 		path::PathBuf,
 		thread,
 	};
@@ -558,18 +587,21 @@ mod tests {
 		let socket_name = format!("flowrider-test-{}", rand::rng().random::<u64>());
 		let cache_dir_str = cache_dir.path().to_str().unwrap().to_owned();
 		let addr = StdSocketAddr::from_abstract_name(socket_name.as_bytes()).expect("abstract socket addr");
+		let listener = StdUnixListener::bind_addr(&addr).expect("Failed to bind abstract socket address");
 
 		// Spawn and detach; the thread blocks forever, so we don’t join.
 		thread::spawn(move || {
 			// unlimited cache, at most 2 concurrent downloads, 2 worker threads
-			start_server(&socket_name, 0, 2, cache_dir_str, 2, None);
+			start_server(listener, 0, 2, cache_dir_str, 2, None);
 		});
 
 		// ────── Client: send request via SocketConnection ─────────
 		let conn = SocketConnection::new(addr, 0);
 
 		// This waits until the server is ready internally.
-		let response = conn.send_message(remote_url.as_str(), local_rel, None, 0).expect("send_message should succeed");
+		let response = conn
+			.send_message(remote_url.as_str(), local_rel, None, 0, cache_dir.path())
+			.expect("send_message should succeed");
 		assert_eq!(response, 1, "server must reply with byte 1");
 
 		// ────── Validate side-effects on disk ─────────────────────

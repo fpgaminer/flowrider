@@ -7,8 +7,11 @@ use std::{
 	env,
 	fmt::Display,
 	fs::{self},
-	io::{Read, Seek, SeekFrom, Write},
-	os::linux::net::SocketAddrExt,
+	io::{Read, Seek, SeekFrom},
+	os::{
+		linux::net::SocketAddrExt,
+		unix::net::{SocketAddr as StdSocketAddr, UnixListener as StdUnixListener},
+	},
 	path::{Path, PathBuf},
 	sync::{Arc, Mutex, atomic::AtomicUsize},
 	thread::{self, JoinHandle},
@@ -26,8 +29,6 @@ use pythonize::{depythonize, pythonize};
 use rand::{prelude::*, seq::index::sample};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
-use std::os::unix::net::SocketAddr as StdSocketAddr;
-use tempfile::{NamedTempFile, TempPath};
 use url::Url;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -161,56 +162,27 @@ impl Config {
 			_ => return Err(PyValueError::new_err("master_addr and master_port must both be set or both be None")),
 		};
 
-		// Create a temporary file and write our server configuration to it.
-		let mut tempfile = NamedTempFile::new().map_err(|e| PyIOError::new_err(format!("Failed to create temporary file: {e:?}")))?;
-		tempfile
-			.write_all(cache_dir.as_bytes())
-			.map_err(|e| PyIOError::new_err(format!("Failed to write to temporary file: {e:?}")))?;
-		tempfile
-			.as_file_mut()
-			.sync_all()
-			.map_err(|e| PyIOError::new_err(format!("Failed to sync temporary file: {e:?}")))?;
+		// Try to bind the socket. Only one process will succeed in binding the socket, and that process will start the cache server.
+		let socket_addr =
+			StdSocketAddr::from_abstract_name(socket_name.as_bytes()).unwrap_or_else(|_| panic!("Failed to create abstract socket address: {socket_name}"));
+		match StdUnixListener::bind_addr(&socket_addr) {
+			Ok(listener) => {
+				info!("Spawning flowrider server at {socket_addr:?}...");
 
-		// Now try to atomically move it to a location all processes agree on.  In this case, the temp folder with the name `<socket_name>-server-config`.
-		// Only one process will succeed in this.  This process will start the cache server, and `<socket_name>-server-config` will reflect the configuration of that running server.
-		// All other processes will read this file to confirm the server is running with the same configuration they expect.
-		// Note that `<socket_name>-server-config` will be cleaned up automatically when the server stops, so we don't need to worry about leaving behind stale files.
-		let server_config_path = tempfile.path().with_file_name(format!("{socket_name}-server-config"));
-		let server_config = match tempfile.persist_noclobber(&server_config_path) {
-			Ok(_) => {
-				// We won the race - spawn the server
-				info!("Spawning flowrider server...");
-
-				let server_config_path = TempPath::from_path(&server_config_path);
 				let cache_dir_clone = cache_dir.to_owned();
-				let socket_name = socket_name.clone();
 				thread::spawn(move || {
 					// This will block until the server is stopped.
-					start_server(&socket_name, cache_limit, max_downloads, cache_dir_clone, num_cache_workers, trace_path);
-
-					// Ensure we hang onto the server config file until the server stops, at which point it will be dropped and thus deleted.
-					drop(server_config_path);
+					start_server(listener, cache_limit, max_downloads, cache_dir_clone, num_cache_workers, trace_path);
 				});
 
 				info!("Flowrider server spawned successfully.");
-
-				cache_dir.to_owned()
 			},
-			Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-				// Another process beat us.  Read the running server's configuration from the file.
-				fs::read_to_string(server_config_path).map_err(|e| PyIOError::new_err(format!("Failed to read server config file: {e:?}")))?
+			Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+				// Another process won the race
 			},
 			Err(e) => {
-				// Something weird happened
-				return Err(PyIOError::new_err(format!("Failed to persist temporary file: {e:?}")));
+				return Err(PyIOError::new_err(format!("Failed to bind to socket {socket_name}: {e:?}")));
 			},
-		};
-
-		// Make sure the running server has the same configuration as us.
-		if server_config.trim() != cache_dir {
-			return Err(PyValueError::new_err(format!(
-				"Cache server already running with a different configuration. Expected cache_dir: {cache_dir}, but got: {server_config}"
-			)));
 		}
 
 		Ok(Config {
@@ -362,7 +334,7 @@ impl StreamingDataset {
 
 		// ask the cache server to make the sample available
 		self.conn
-			.send_message(sample_remote.as_str(), &sample_local, Some(py), worker_id)
+			.send_message(sample_remote.as_str(), &sample_local, Some(py), worker_id, &self.config.cache_dir)
 			.map_err(|e| PyIOError::new_err(format!("Failed to send message to cache server: {e:?}")))?;
 
 		// once the above request returns, the shard should be available on the filesystem
@@ -557,7 +529,7 @@ fn dataset_readahead(iter: Arc<DatasetIteratorInner>, dataset: Arc<StreamRanges>
 
 		trace!("[worker={}] readahead {}", worker_id, stream.local);
 
-		if let Err(err) = conn.send_message(stream_remote.as_str(), &stream_local, None, worker_id) {
+		if let Err(err) = conn.send_message(stream_remote.as_str(), &stream_local, None, worker_id, &config.cache_dir) {
 			error!("[worker={worker_id}] Failed to send message to cache server for readahead: {err:?}");
 			continue;
 		}
@@ -702,12 +674,13 @@ fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, 
 	for _ in 0..config.max_downloads {
 		let remotes_and_locals = remotes_and_locals.clone();
 		let socket_addr = socket_addr.clone();
+		let config = config.clone();
 
 		threads.push(thread::spawn(move || {
 			let conn = SocketConnection::new(socket_addr, global_rank);
 
 			while let Some((remote_index, local_index)) = remotes_and_locals.lock().unwrap().pop() {
-				if let Err(err) = conn.send_message(remote_index.as_str(), local_index.as_str(), None, 0) {
+				if let Err(err) = conn.send_message(remote_index.as_str(), local_index.as_str(), None, 0, &config.cache_dir) {
 					error!("Failed to send message to cache server: {err:?}");
 				}
 			}

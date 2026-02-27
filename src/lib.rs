@@ -63,7 +63,7 @@ fn flowrider(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 
-#[pyclass(frozen, str)]
+#[pyclass(from_py_object, frozen, str)]
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
 	/// Rank of this process on the local node (0 for the first process).
@@ -392,8 +392,8 @@ impl StreamingDataset {
 		};
 		let obj = pythonize(py, &snapshot).map_err(|e| PyValueError::new_err(format!("Failed to pythonize StreamingDataset state: {e:?}")))?;
 
-		obj.downcast_into::<PyDict>()
-			.map_err(|_| PyValueError::new_err("Failed to downcast StreamingDataset state to PyDict"))
+		obj.cast_into::<PyDict>()
+			.map_err(|_| PyValueError::new_err("Failed to cast StreamingDataset state to PyDict"))
 	}
 
 	/// Called to unpickle the object.
@@ -693,7 +693,7 @@ fn download_indexes<'py>(remotes_and_locals: &[(Url, String)], config: &Config, 
 	// Calls check_signals to ensure we handle any signals that might have been sent to the process.
 	while !threads.is_empty() {
 		py.check_signals()?;
-		py.allow_threads(|| {
+		py.detach(|| {
 			thread::sleep(std::time::Duration::from_millis(100));
 
 			for i in (0..threads.len()).rev() {
@@ -902,7 +902,7 @@ impl OptionPythonExt for Option<Python<'_>> {
 		F: Ungil + FnOnce() -> T,
 		T: Ungil,
 	{
-		if let Some(py) = self { py.allow_threads(f) } else { f() }
+		if let Some(py) = self { py.detach(f) } else { f() }
 	}
 }
 
@@ -910,7 +910,7 @@ impl OptionPythonExt for Option<Python<'_>> {
 /// Does a std::thread::sleep, but allows the Python GIL to be released during the sleep (if `py` is Some).
 fn std_sleep_allow_threads<'py>(duration: std::time::Duration, py: Option<Python<'py>>) {
 	if let Some(py) = py {
-		py.allow_threads(|| thread::sleep(duration));
+		py.detach(|| thread::sleep(duration));
 	} else {
 		thread::sleep(duration);
 	}
@@ -1250,7 +1250,7 @@ mod tests {
 			// Try different world sizes and worker counts
 			for (num_workers, world_size) in (1..=4).flat_map(|w| (1..=8).map(move |r| (w, r))) {
 				// Only consider cases where the samples are cleanly divisible
-				if total_samples % (micro_batch_size * world_size) != 0 {
+				if !total_samples.is_multiple_of(micro_batch_size * world_size) {
 					continue;
 				}
 
@@ -1508,7 +1508,7 @@ mod tests {
 		let mut workers_work = Vec::new();
 
 		assert!(
-			batch_size % (world_size as usize * micro_batch_size) == 0,
+			batch_size.is_multiple_of(world_size as usize * micro_batch_size),
 			"Batch size must be divisible by world_size * micro_batch_size"
 		);
 

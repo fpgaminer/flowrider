@@ -220,7 +220,7 @@ pub struct IndexJson {
 }
 
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Deserialize, Debug, Clone, Serialize)]
 pub enum ColumnEncoding {
 	#[serde(rename = "str")]
@@ -317,7 +317,7 @@ impl ColumnValue {
 			ColumnEncoding::Uint16 => Ok(ColumnValue::Uint16(value.extract()?)),
 			ColumnEncoding::Uint32 => Ok(ColumnValue::Uint32(value.extract()?)),
 			ColumnEncoding::Uint64 => Ok(ColumnValue::Uint64(value.extract()?)),
-			ColumnEncoding::Bytes => Ok(ColumnValue::Bytes(value.downcast::<PyBytes>()?.as_bytes().to_vec())),
+			ColumnEncoding::Bytes => Ok(ColumnValue::Bytes(value.cast::<PyBytes>()?.as_bytes().to_vec())),
 			ColumnEncoding::Float32 => Ok(ColumnValue::Float32(value.extract()?)),
 			ColumnEncoding::Float64 => Ok(ColumnValue::Float64(value.extract()?)),
 			_ => Err(PyValueError::new_err("Unsupported column encoding for value extraction")),
@@ -396,14 +396,17 @@ mod tests {
 	}
 
 	/// Helper: unwraps the NumPy scalar back to a Rust value
-	fn extract_scalar<'py, T: FromPyObject<'py>>(obj: Bound<'py, PyAny>) -> T {
+	fn extract_scalar<'py, T>(obj: &Bound<'py, PyAny>) -> T
+	where
+		T: FromPyObjectOwned<'py>,
+	{
 		// `.item()` gives a pure-Python scalar that PyO3 can directly extract
-		obj.call_method0("item").unwrap().extract().unwrap()
+		obj.call_method0("item").unwrap().extract::<T>().map_err(Into::into).unwrap()
 	}
 
 	#[test]
 	fn str_roundtrip() {
-		Python::with_gil(|py| {
+		Python::attach(|py| {
 			let text = "FlowRider🚀";
 			let mut buf = Vec::new();
 			ColumnValue::Str(text.to_string()).encode(&mut buf).unwrap();
@@ -414,7 +417,7 @@ mod tests {
 
 	#[test]
 	fn bytes_roundtrip() {
-		Python::with_gil(|py| {
+		Python::attach(|py| {
 			let data = b"\x00\xff\x10\x20".to_vec();
 			let mut buf = Vec::new();
 			ColumnValue::Bytes(data.clone()).encode(&mut buf).unwrap();
@@ -427,14 +430,14 @@ mod tests {
 		($name:ident, $enc:path, $ty:ty, $val:expr) => {
 			#[test]
 			fn $name() {
-				Python::with_gil(|py| {
+				Python::attach(|py| {
 					let value: $ty = $val;
 					let obj = decode(
 						py,
 						$enc,
 						value.to_le_bytes().to_vec(), // little-endian, just like the loader expects
 					);
-					let extracted: $ty = extract_scalar(obj);
+					let extracted: $ty = extract_scalar(&obj);
 					assert_eq!(extracted, value);
 				});
 			}
@@ -454,7 +457,7 @@ mod tests {
 
 	#[test]
 	fn insufficient_buffer_returns_error() {
-		Python::with_gil(|py| {
+		Python::attach(|py| {
 			let np = py.import("numpy").unwrap();
 			let frombuffer = np.getattr("frombuffer").unwrap();
 
@@ -476,7 +479,7 @@ mod tests {
 
 	#[test]
 	fn float16_roundtrip() {
-		Python::with_gil(|py| {
+		Python::attach(|py| {
 			// IEEE‑754 half‑precision 1.0  → 0x3c00 (little endian)
 			let half_1_0 = vec![0x00, 0x3c];
 			let np = py.import("numpy").unwrap();
@@ -492,7 +495,7 @@ mod tests {
 		($name:ident, $val:expr, $enc:ident, $ty:ty) => {
 			#[test]
 			fn $name() {
-				Python::with_gil(|py| {
+				Python::attach(|py| {
 					let value: $ty = $val;
 
 					// encode ---------------------------------------------------
@@ -526,7 +529,7 @@ mod tests {
 
 	#[test]
 	fn decode_sample_mixed_columns() {
-		Python::with_gil(|py| {
+		Python::attach(|py| {
 			let columns = vec![
 				("txt".to_owned(), ColumnEncoding::Str),
 				("num".to_owned(), ColumnEncoding::Int16),
@@ -554,7 +557,7 @@ mod tests {
 	}
 
 	fn exercise_sample_writer(compress: bool) {
-		Python::with_gil(|py| {
+		Python::attach(|py| {
 			let tmp = tempdir().unwrap();
 			let mut cols = HashMap::new();
 			cols.insert("txt".into(), ColumnEncoding::Str);

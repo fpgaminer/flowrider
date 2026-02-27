@@ -47,3 +47,7 @@ line-length = 120
 
 [tool.ruff.format]
 indent-style = "tab"
+
+[tool.ruff.lint]
+# If you lint, don't flag tabs as an error:
+ignore = ["W191"]

@@ -519,7 +519,7 @@ mod tests {
 
 	use super::{SocketConnection, read_string};
 	use byteorder::{LittleEndian, WriteBytesExt};
-	use rand::Rng;
+	use rand::RngExt as _;
 	use std::{
 		fs,
 		io::{Cursor, Read},

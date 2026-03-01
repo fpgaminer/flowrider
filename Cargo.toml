@@ -38,6 +38,8 @@ tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["smallvec", "fmt", "ansi", "std", "time", "env-filter", "registry"] }
 tracing = "0.1"
 ignore = "0.4"
+zstd = "0.13"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 
 [features]
 extension-module = ["pyo3/extension-module"]

@@ -1,5 +1,6 @@
 mod cache;
 mod encoding;
+mod heavy_data;
 mod server;
 
 use std::{
@@ -34,6 +35,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use crate::{
 	encoding::{ColumnEncoding, IndexJson, SampleWriter, decode_sample, sample_index_to_path},
+	heavy_data::HeavyData,
 	server::{SocketConnection, start_server},
 };
 
@@ -59,6 +61,7 @@ fn flowrider(m: &Bound<'_, PyModule>) -> PyResult<()> {
 	m.add_class::<Config>()?;
 	m.add_class::<SampleWriter>()?;
 	m.add_class::<ColumnEncoding>()?;
+	m.add_class::<HeavyData>()?;
 	Ok(())
 }
 

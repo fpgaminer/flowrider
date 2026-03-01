@@ -221,7 +221,7 @@ pub struct IndexJson {
 
 
 #[pyclass(from_py_object)]
-#[derive(Deserialize, Debug, Clone, Serialize)]
+#[derive(Deserialize, Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum ColumnEncoding {
 	#[serde(rename = "str")]
 	Str,
@@ -285,6 +285,43 @@ impl ColumnEncoding {
 			ColumnEncoding::Float16 => numpy_frombuffer_scalar(np_frombuffer, "<f2", &mut reader, 2),
 			ColumnEncoding::Float32 => numpy_frombuffer_scalar(np_frombuffer, "<f4", &mut reader, 4),
 			ColumnEncoding::Float64 => numpy_frombuffer_scalar(np_frombuffer, "<f8", &mut reader, 8),
+		}
+	}
+
+	pub fn to_str(&self) -> &'static str {
+		match self {
+			ColumnEncoding::Str => "str",
+			ColumnEncoding::Int8 => "int8",
+			ColumnEncoding::Int16 => "int16",
+			ColumnEncoding::Int32 => "int32",
+			ColumnEncoding::Int64 => "int64",
+			ColumnEncoding::Uint8 => "uint8",
+			ColumnEncoding::Uint16 => "uint16",
+			ColumnEncoding::Uint32 => "uint32",
+			ColumnEncoding::Uint64 => "uint64",
+			ColumnEncoding::Bytes => "bytes",
+			ColumnEncoding::Float16 => "float16",
+			ColumnEncoding::Float32 => "float32",
+			ColumnEncoding::Float64 => "float64",
+		}
+	}
+
+	pub fn from_str(value: &str) -> Option<Self> {
+		match value {
+			"str" => Some(ColumnEncoding::Str),
+			"int8" => Some(ColumnEncoding::Int8),
+			"int16" => Some(ColumnEncoding::Int16),
+			"int32" => Some(ColumnEncoding::Int32),
+			"int64" => Some(ColumnEncoding::Int64),
+			"uint8" => Some(ColumnEncoding::Uint8),
+			"uint16" => Some(ColumnEncoding::Uint16),
+			"uint32" => Some(ColumnEncoding::Uint32),
+			"uint64" => Some(ColumnEncoding::Uint64),
+			"bytes" => Some(ColumnEncoding::Bytes),
+			"float16" => Some(ColumnEncoding::Float16),
+			"float32" => Some(ColumnEncoding::Float32),
+			"float64" => Some(ColumnEncoding::Float64),
+			_ => None,
 		}
 	}
 }

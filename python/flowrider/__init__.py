@@ -1,5 +1,5 @@
 from .flowrider import StreamingDataset as StreamingDatasetRust
-from .flowrider import Config, ColumnEncoding, SampleWriter
+from .flowrider import Config, ColumnEncoding, SampleWriter, HeavyData
 from torch.utils.data import IterableDataset, DataLoader
 import torch
 from collections.abc import Mapping, Sequence
@@ -11,6 +11,7 @@ __all__ = [
 	"StreamingDataLoader",
 	"ColumnEncoding",
 	"SampleWriter",
+	"HeavyData",
 ]
 
 

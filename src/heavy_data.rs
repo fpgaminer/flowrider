@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS shard_positions (
 pub struct HeavyData {
 	path: PathBuf,
 	conn: Mutex<Connection>,
-	columns: Vec<(String, ColumnEncoding)>,
+	columns: Vec<(String, ColumnEncoding)>, // Sorted and canonical
 	worker: Option<JoinHandle<()>>,
 	work_tx: Option<mpsc::SyncSender<SampleWriterJob>>,
 	result_rx: Mutex<mpsc::Receiver<anyhow::Error>>,
@@ -75,14 +75,12 @@ pub struct HeavyData {
 #[pymethods]
 impl HeavyData {
 	#[new]
-	fn new(path: &str, columns: HashMap<String, ColumnEncoding>, compression_level: i32) -> PyResult<HeavyData> {
+	#[pyo3(signature = (path, columns=None, *, compression_level=9))]
+	fn new(path: &str, columns: Option<HashMap<String, ColumnEncoding>>, compression_level: i32) -> PyResult<HeavyData> {
 		let path = PathBuf::from(path);
 
-		// Sort the columns by name to ensure consistent order
-		let mut columns: Vec<_> = columns.into_iter().collect();
-		columns.sort_by(|a, b| a.0.cmp(&b.0));
-
-		let conn = create_or_resume_index(&path, &columns).map_err(|e| PyValueError::new_err(format!("Failed to create or resume index: {e:?}")))?;
+		let (conn, columns) =
+			create_or_resume_index(&path, columns.as_ref()).map_err(|e| PyValueError::new_err(format!("Failed to create or resume index: {e:?}")))?;
 
 		// Spawn the worker thread so writes can happen in the background
 		let (result_tx, result_rx) = mpsc::channel();
@@ -357,20 +355,51 @@ fn sample_writer_worker(rx: mpsc::Receiver<SampleWriterJob>, path: PathBuf, comp
 
 /// Open the index at the given path, creating it if it doesn't exist, and verify that the columns match the provided schema.  Returns a connection to the index database.
 /// Assumes columns is already sorted by name.
-fn create_or_resume_index(path: &Path, columns: &[(String, ColumnEncoding)]) -> anyhow::Result<Connection> {
+/// If columns is None, this will read the existing schema from the database.  If the database does not exist in this case an error will be returned.
+/// Returns the index database connection and the canonical column schema (matching the on-disk schema).
+fn create_or_resume_index(path: &Path, columns: Option<&HashMap<String, ColumnEncoding>>) -> anyhow::Result<(Connection, Vec<(String, ColumnEncoding)>)> {
 	fs::create_dir_all(path).context("Failed to create index directory")?;
+	ensure!(
+		columns.map(|cols| !cols.is_empty()).unwrap_or(true),
+		"At least one column must be provided when creating a new index"
+	);
 
 	// Open the index database
 	let index_path = path.join("index.sqlite");
-	let mut conn = Connection::open(&index_path).context("Failed to open index SQLite database")?;
+	let mut flags = rusqlite::OpenFlags::default();
+	if columns.is_none() {
+		// If columns is None, we expect the database to already exist, so we don't allow creating a new one.
+		flags.set(rusqlite::OpenFlags::SQLITE_OPEN_CREATE, false);
+	}
+	let mut conn = Connection::open_with_flags(&index_path, flags).context("Failed to open index SQLite database")?;
 	conn.pragma_update(None, "journal_mode", "WAL")?;
 
 	// Create tables if they don't exist
 	conn.execute_batch(INDEX_SCHEMA_SQL).context("Failed to create/verify index schema")?;
 
-	// Check if the columns table is empty.  If it is, we write the provided schema to it.  If it isn't, we verify that the existing schema matches the provided schema.
-	let existing_columns: Vec<(String, ColumnEncoding)> = {
-		let mut stmt = conn.prepare("SELECT name, encoding FROM columns ORDER BY name")?;
+	let db_columns: Vec<(String, ColumnEncoding)> = {
+		// Check if the database already has a schema or not
+		let column_count = conn.query_one("SELECT COUNT(*) FROM columns", [], |row| row.get::<_, i64>(0))?;
+		match (column_count, columns) {
+			// Database does not have a schema, but columns were provided - we create the schema from the provided columns
+			(0, Some(cols)) => {
+				let tx = conn.transaction()?;
+				for (name, encoding) in cols {
+					tx.execute("INSERT INTO columns (name, encoding) VALUES (?1, ?2)", (name, encoding))?;
+				}
+				tx.commit()?;
+			},
+
+			// Database does not have a schema and no columns were provided - we cannot proceed since we don't know the schema
+			(0, None) => anyhow::bail!("No columns provided and index database does not contain an existing schema"),
+
+			// Schema already exists in the database.
+			(_, Some(_)) => {},
+			(_, None) => {},
+		}
+
+		// Read the existing schema from the database, sorted for consistency
+		let mut stmt = conn.prepare("SELECT name, encoding FROM columns ORDER BY name ASC")?;
 		stmt.query_map([], |row| {
 			let name: String = row.get(0)?;
 			let encoding: ColumnEncoding = row.get(1)?;
@@ -380,17 +409,17 @@ fn create_or_resume_index(path: &Path, columns: &[(String, ColumnEncoding)]) -> 
 		.context("Failed to query existing columns from index database")?
 	};
 
-	if existing_columns.is_empty() {
-		let tx = conn.transaction()?;
-		for (name, encoding) in columns {
-			tx.execute("INSERT INTO columns (name, encoding) VALUES (?1, ?2)", (name, encoding))?;
-		}
-		tx.commit()?;
-	} else {
-		ensure!(existing_columns == columns, "Existing index schema does not match the provided schema");
+	// If columns were provided, verify that they match the existing schema in the database.  This ensures that if the index already exists on disk, we don't accidentally use the wrong schema to interpret it.
+	if let Some(provided_columns) = columns {
+		let mut provided_columns = provided_columns.iter().collect::<Vec<_>>();
+		provided_columns.sort_by(|a, b| a.0.cmp(b.0));
+		ensure!(
+			db_columns.iter().map(|(a, b)| (a, b)).eq(provided_columns.iter().copied()),
+			"Existing index schema does not match the provided schema.  Existing: {db_columns:?}, Provided: {provided_columns:?}"
+		);
 	}
 
-	Ok(conn)
+	Ok((conn, db_columns))
 }
 
 
@@ -459,7 +488,7 @@ mod tests {
 			columns.insert("flt".to_string(), ColumnEncoding::Float32);
 
 			// Create store + write random data
-			let mut hd = HeavyData::new(store_dir_str, columns.clone(), 3).expect("create HeavyData");
+			let mut hd = HeavyData::new(store_dir_str, Some(columns.clone()), 3).expect("create HeavyData");
 			let n_samples = 200usize;
 			let mut cases = Vec::with_capacity(n_samples);
 
@@ -490,7 +519,7 @@ mod tests {
 			drop(hd);
 
 			// Re-open the DB/store from disk and read everything back.
-			let mut hd = HeavyData::new(store_dir_str, columns, 3).expect("reopen HeavyData");
+			let mut hd = HeavyData::new(store_dir_str, Some(columns), 3).expect("reopen HeavyData");
 
 			// Validate existing_keys contains everything (and count matches)
 			let existing = hd.existing_keys(py).expect("existing_keys");
@@ -535,12 +564,12 @@ mod tests {
 		let tmp = tempdir().unwrap();
 		let path = tmp.path();
 
-		let cols1 = vec![("a".to_string(), ColumnEncoding::Str)];
-		let _conn = create_or_resume_index(path, &cols1).expect("first create_or_resume_index should succeed");
+		let cols1 = HashMap::from([("a".to_string(), ColumnEncoding::Str)]);
+		let _conn = create_or_resume_index(path, Some(&cols1)).expect("first create_or_resume_index should succeed");
 
 		// Same column name but different encoding
-		let cols2 = vec![("a".to_string(), ColumnEncoding::Uint32)];
-		let err = create_or_resume_index(path, &cols2).expect_err("schema mismatch must error");
+		let cols2 = HashMap::from([("a".to_string(), ColumnEncoding::Uint32)]);
+		let err = create_or_resume_index(path, Some(&cols2)).expect_err("schema mismatch must error");
 		let msg = format!("{err:#}");
 		assert!(
 			msg.contains("Existing index schema does not match the provided schema"),
@@ -555,10 +584,10 @@ mod tests {
 		let tmp = tempdir().unwrap();
 		let path = tmp.path();
 
-		let columns = vec![("txt".to_string(), ColumnEncoding::Str)];
+		let columns = HashMap::from([("txt".to_string(), ColumnEncoding::Str)]);
 		let key = b"abcd-efgh-ijkl-mnop".to_vec();
 
-		let conn = create_or_resume_index(path, &columns).unwrap();
+		let (conn, columns) = create_or_resume_index(path, Some(&columns)).unwrap();
 
 		// Build a well-formed payload (key + bytes + *wrong* checksum).
 		let mut sample_bytes = Vec::new();
@@ -602,12 +631,12 @@ mod tests {
 		let tmp = tempdir().unwrap();
 		let path = tmp.path();
 
-		let columns = vec![("txt".to_string(), ColumnEncoding::Str)];
+		let columns = HashMap::from([("txt".to_string(), ColumnEncoding::Str)]);
 		let key = b"original-key-1234".to_vec();
 		let on_disk_key = b"otherxxx-key-5678".to_vec();
 		assert_eq!(key.len(), on_disk_key.len(), "keys must be same length for this test");
 
-		let conn = create_or_resume_index(path, &columns).unwrap();
+		let (conn, columns) = create_or_resume_index(path, Some(&columns)).unwrap();
 
 		let mut sample_bytes = Vec::new();
 		sample_bytes.extend_from_slice(&on_disk_key);

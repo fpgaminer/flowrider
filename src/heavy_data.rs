@@ -67,9 +67,36 @@ pub struct HeavyData {
 	path: PathBuf,
 	conn: Mutex<Connection>,
 	columns: Vec<(String, ColumnEncoding)>, // Sorted and canonical
-	worker: Option<JoinHandle<()>>,
-	work_tx: Option<mpsc::SyncSender<SampleWriterJob>>,
+	compression_level: i32,
+	worker: Option<HeavyDataWorker>,
+}
+
+struct HeavyDataWorker {
+	handle: JoinHandle<()>,
+	work_tx: mpsc::SyncSender<SampleWriterJob>,
 	result_rx: Mutex<mpsc::Receiver<anyhow::Error>>,
+	owner_pid: u32,
+}
+
+impl HeavyDataWorker {
+	fn new(path: PathBuf, compression_level: i32) -> Self {
+		let (result_tx, result_rx) = mpsc::channel();
+		let (work_tx, work_rx) = mpsc::sync_channel(MAX_WRITE_QUEUE);
+
+		let path_clone = path.clone();
+		let handle = thread::spawn(move || {
+			if let Err(e) = sample_writer_worker(work_rx, path_clone, compression_level) {
+				let _ = result_tx.send(e);
+			}
+		});
+
+		Self {
+			handle,
+			work_tx,
+			result_rx: Mutex::new(result_rx),
+			owner_pid: std::process::id(),
+		}
+	}
 }
 
 #[pymethods]
@@ -82,24 +109,12 @@ impl HeavyData {
 		let (conn, columns) =
 			create_or_resume_index(&path, columns.as_ref()).map_err(|e| PyValueError::new_err(format!("Failed to create or resume index: {e:?}")))?;
 
-		// Spawn the worker thread so writes can happen in the background
-		let (result_tx, result_rx) = mpsc::channel();
-		let (work_tx, work_rx) = mpsc::sync_channel(MAX_WRITE_QUEUE);
-
-		let path_clone = path.clone();
-		let worker = thread::spawn(move || {
-			if let Err(e) = sample_writer_worker(work_rx, path_clone, compression_level) {
-				let _ = result_tx.send(e);
-			}
-		});
-
 		Ok(HeavyData {
 			path,
 			conn: Mutex::new(conn),
 			columns,
-			worker: Some(worker),
-			work_tx: Some(work_tx),
-			result_rx: Mutex::new(result_rx),
+			compression_level,
+			worker: None,
 		})
 	}
 
@@ -117,10 +132,16 @@ impl HeavyData {
 			.map(Some)
 	}
 
-	fn write<'py>(&self, key: &[u8], sample: Bound<'py, PyDict>, py: Python<'py>) -> PyResult<()> {
-		let Some(work_tx) = &self.work_tx else {
-			return Err(PyValueError::new_err("Cannot write to HeavyData after it has been finished"));
-		};
+	fn write<'py>(&mut self, key: &[u8], sample: Bound<'py, PyDict>, py: Python<'py>) -> PyResult<()> {
+		let worker = self
+			.worker
+			.get_or_insert_with(|| HeavyDataWorker::new(self.path.clone(), self.compression_level));
+
+		if worker.owner_pid != std::process::id() {
+			return Err(PyValueError::new_err(
+				"HeavyData writer was inherited across fork; this is not supported since the worker thread does not exist in the child process",
+			));
+		}
 
 		let sample_values = self
 			.columns
@@ -136,11 +157,11 @@ impl HeavyData {
 			sample: sample_values,
 		};
 
-		py.detach(|| work_tx.send(job))
+		py.detach(|| worker.work_tx.send(job))
 			.map_err(|e| PyIOError::new_err(format!("Failed to send job to worker: {e:?}")))?;
 
 		// Check for errors from workers
-		let result_rx = self
+		let result_rx = worker
 			.result_rx
 			.lock()
 			.map_err(|e| PyIOError::new_err(format!("Failed to lock result receiver: {e:?}")))?;
@@ -152,16 +173,25 @@ impl HeavyData {
 	}
 
 	fn finish<'py>(&mut self, py: Python<'py>) -> PyResult<()> {
-		// Signal worker to finish by dropping the sender
-		self.work_tx.take();
+		let Some(worker) = self.worker.take() else {
+			return Ok(()); // Already finished
+		};
 
-		// Wait for the worker to finish
-		if let Some(worker) = self.worker.take() {
-			py.detach(|| worker.join().map_err(|_| PyValueError::new_err("Worker thread panicked")))?;
+		if worker.owner_pid != std::process::id() {
+			// Process was forked after creating the worker, which means the thread doesn't exist here
+			return Err(PyValueError::new_err(
+				"HeavyData writer was inherited across fork; this is not supported since the worker thread does not exist in the child process",
+			));
 		}
 
+		// Signal worker to finish by dropping the sender
+		drop(worker.work_tx);
+
+		// Wait for the worker to finish
+		py.detach(|| worker.handle.join().map_err(|_| PyValueError::new_err("Worker thread panicked")))?;
+
 		// Check for errors from workers
-		let result_rx = self
+		let result_rx = worker
 			.result_rx
 			.lock()
 			.map_err(|e| PyIOError::new_err(format!("Failed to lock result receiver: {e:?}")))?;
@@ -249,11 +279,9 @@ impl HeavyData {
 
 impl Drop for HeavyData {
 	fn drop(&mut self) {
-		// We ignore errors in drop since there's not much we can do about them, but we log them for debugging purposes.
+		// We ignore errors in drop since there's not much we can do about them
 		Python::try_attach(|py| {
-			if let Err(e) = self.finish(py) {
-				eprintln!("Error finishing HeavyData in drop: {e:?}");
-			}
+			let _ = self.finish(py);
 		});
 	}
 }
@@ -456,10 +484,7 @@ mod tests {
 	};
 	use rand::RngExt as _;
 	use rusqlite::params;
-	use std::{
-		collections::HashMap,
-		sync::{Mutex, mpsc},
-	};
+	use std::collections::HashMap;
 	use tempfile::tempdir;
 	use xxhash_rust::xxh3::xxh3_128;
 
@@ -587,7 +612,7 @@ mod tests {
 		let columns = HashMap::from([("txt".to_string(), ColumnEncoding::Str)]);
 		let key = b"abcd-efgh-ijkl-mnop".to_vec();
 
-		let (conn, columns) = create_or_resume_index(path, Some(&columns)).unwrap();
+		let (conn, _columns) = create_or_resume_index(path, Some(&columns)).unwrap();
 
 		// Build a well-formed payload (key + bytes + *wrong* checksum).
 		let mut sample_bytes = Vec::new();
@@ -606,15 +631,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let (_tx, rx) = mpsc::channel();
-		let hd = HeavyData {
-			path: path.to_path_buf(),
-			conn: Mutex::new(conn),
-			columns,
-			worker: None,
-			work_tx: None,
-			result_rx: Mutex::new(rx),
-		};
+		let hd = HeavyData::new(path.to_str().unwrap(), None, 1).unwrap();
 
 		let err = hd.read_sample_data(&key).unwrap_err();
 		let msg = format!("{err:#}");
@@ -636,7 +653,7 @@ mod tests {
 		let on_disk_key = b"otherxxx-key-5678".to_vec();
 		assert_eq!(key.len(), on_disk_key.len(), "keys must be same length for this test");
 
-		let (conn, columns) = create_or_resume_index(path, Some(&columns)).unwrap();
+		let (conn, _columns) = create_or_resume_index(path, Some(&columns)).unwrap();
 
 		let mut sample_bytes = Vec::new();
 		sample_bytes.extend_from_slice(&on_disk_key);
@@ -654,15 +671,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let (_tx, rx) = mpsc::channel();
-		let hd = HeavyData {
-			path: path.to_path_buf(),
-			conn: Mutex::new(conn),
-			columns,
-			worker: None,
-			work_tx: None,
-			result_rx: Mutex::new(rx),
-		};
+		let hd = HeavyData::new(path.to_str().unwrap(), None, 1).unwrap();
 
 		let err = hd.read_sample_data(&key).unwrap_err();
 		let msg = format!("{err:#}");
